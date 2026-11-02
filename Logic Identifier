@@ -1,6 +1,6 @@
 Option Explicit
 
-Private Const TASK_SHEET As String = "Tasks"
+'Change to ";" if your predecessor lists use semicolons.
 Private Const LIST_SEPARATOR As String = ","
 
 Private Type AuditTask
@@ -12,8 +12,8 @@ Private Type AuditTask
     PredCount As Long
     RemovedCount As Long
 
-    StartCount As Long       'FS and SS links
-    FinishCount As Long      'FF and SF links
+    StartCount As Long
+    FinishCount As Long
     RemovedStart As Long
     RemovedFinish As Long
 
@@ -26,48 +26,104 @@ End Type
 
 Public Sub AuditRemovalOfTaskLinks()
 
-    Dim wb As Workbook, ws As Worksheet
-    Dim tasks() As AuditTask
-    Dim successors() As Collection
-    Dim byKey As Object, seenEdges As Object
-
-    Dim data As Variant, headers As Variant
-    Dim parts As Variant, part As Variant
+    Dim wb As Workbook
+    Dim ws As Worksheet
+    Dim pickedCell As Range
     Dim lastCell As Range
 
-    Dim n As Long, i As Long, j As Long
-    Dim predecessor As Long, selected As Long
+    Dim tasks() As AuditTask
+    Dim successors() As Collection
 
-    Dim predText As String, predKey As String
-    Dim linkType As String, linkLag As String
-    Dim linkLabel As String, edgeKey As String
+    Dim byKey As Object
+    Dim seenEdges As Object
+
+    Dim data As Variant
+    Dim headers As Variant
+    Dim parts As Variant
+    Dim part As Variant
+
+    Dim n As Long
+    Dim i As Long
+    Dim j As Long
+    Dim predecessor As Long
+    Dim selected As Long
+
+    Dim predText As String
+    Dim predKey As String
+    Dim linkType As String
+    Dim linkLag As String
+    Dim linkLabel As String
+    Dim edgeKey As String
     Dim stage As String
 
     On Error GoTo Failed
 
-    Set wb = ThisWorkbook
-    stage = "Reading the Tasks worksheet"
-    Set ws = wb.Worksheets(TASK_SHEET)
+    '------------------------------------------------------------
+    'Select the actual export worksheet.
+    'The macro can be stored in another workbook or PERSONAL.XLSB.
+    '------------------------------------------------------------
+    stage = "Selecting the export worksheet"
 
-    headers = Array("Project", "Unique ID", "Name", _
-                    "Unique ID Predecessors")
+    Set pickedCell = Nothing
+
+    'Cancel returns False, which cannot be assigned to a Range.
+    'Suppress that assignment error and test for Nothing afterward.
+    On Error Resume Next
+
+    Set pickedCell = Application.InputBox( _
+        Prompt:="Select any cell on the worksheet containing " & _
+                "your Microsoft Project export.", _
+        Title:="Select Project export worksheet", _
+        Type:=8)
+
+    On Error GoTo Failed
+
+    If pickedCell Is Nothing Then Exit Sub
+
+    Set ws = pickedCell.Worksheet
+    Set wb = ws.Parent
+
+    stage = "Reading export worksheet: " & _
+            wb.Name & " / " & ws.Name
+
+    '------------------------------------------------------------
+    'Validate the export headers.
+    '------------------------------------------------------------
+    headers = Array( _
+        "Project", _
+        "Unique ID", _
+        "Name", _
+        "Unique ID Predecessors")
 
     For j = 0 To UBound(headers)
-        If StrComp(TextValue(ws.Cells(1, j + 1).Value2), _
-                   CStr(headers(j)), vbTextCompare) <> 0 Then
+
+        If StrComp( _
+            TextValue(ws.Cells(1, j + 1).Value2), _
+            CStr(headers(j)), _
+            vbTextCompare) <> 0 Then
+
             StopAudit "Column " & (j + 1) & _
                       " must have the header: " & headers(j)
         End If
     Next j
 
     Set lastCell = ws.Range("A:D").Find( _
-        What:="*", After:=ws.Cells(1, 1), _
-        LookIn:=xlFormulas, LookAt:=xlPart, _
-        SearchOrder:=xlByRows, SearchDirection:=xlPrevious, _
-        MatchCase:=False, SearchFormat:=False)
+        What:="*", _
+        After:=ws.Cells(1, 1), _
+        LookIn:=xlFormulas, _
+        LookAt:=xlPart, _
+        SearchOrder:=xlByRows, _
+        SearchDirection:=xlPrevious, _
+        MatchCase:=False, _
+        SearchFormat:=False)
 
-    If lastCell Is Nothing Then StopAudit "No task data found."
-    If lastCell.Row < 2 Then StopAudit "No task rows found."
+    If lastCell Is Nothing Then
+        StopAudit "No task data found."
+    End If
+
+    If lastCell.Row < 2 Then
+        StopAudit "No task rows found."
+    End If
 
     data = ws.Range("A2:D" & lastCell.Row).Value2
     n = UBound(data, 1)
@@ -85,9 +141,13 @@ Public Sub AuditRemovalOfTaskLinks()
     Set seenEdges = CreateObject("Scripting.Dictionary")
     seenEdges.CompareMode = vbTextCompare
 
-    'Index every task by its owning project and source UID.
+    '------------------------------------------------------------
+    'Index tasks using Project + source-project Unique ID.
+    '------------------------------------------------------------
     For i = 1 To n
-        stage = "Reading Tasks row " & (i + 1)
+
+        stage = "Reading worksheet '" & ws.Name & _
+                "', row " & (i + 1)
 
         With tasks(i)
             .ProjectFile = TextValue(data(i, 1))
@@ -96,7 +156,8 @@ Public Sub AuditRemovalOfTaskLinks()
             .Key = TaskKey(.ProjectFile, .UID)
 
             If byKey.Exists(.Key) Then
-                StopAudit "Duplicate task key: " & .Key & vbCrLf & _
+                StopAudit "Duplicate task key: " & .Key & _
+                          vbCrLf & _
                           "Use one real source record per task."
             End If
 
@@ -106,30 +167,44 @@ Public Sub AuditRemovalOfTaskLinks()
         Set successors(i) = New Collection
     Next i
 
+    '------------------------------------------------------------
+    'Ask which task's outgoing links should be audited.
+    '------------------------------------------------------------
     stage = "Selecting the task"
+
     selected = AskForTask(tasks, byKey)
+
     If selected = 0 Then Exit Sub
 
-    'Build the ORIGINAL graph and record the hypothetical removals.
-    'The source worksheet and the graph's other links are not changed.
+    '------------------------------------------------------------
+    'Build the original dependency graph.
+    '
+    'Record the hypothetical removal of all outgoing links from
+    'the selected task. Do not modify the export or source project.
+    '------------------------------------------------------------
     For i = 1 To n
 
-        stage = "Reading predecessors in Tasks row " & (i + 1)
+        stage = "Reading predecessors on worksheet '" & _
+                ws.Name & "', row " & (i + 1)
+
         predText = TextValue(data(i, 4))
 
         If Len(predText) > 0 Then
+
             parts = Split(predText, LIST_SEPARATOR)
 
             For Each part In parts
 
-                stage = "Tasks row " & (i + 1) & _
+                stage = "Worksheet '" & ws.Name & _
+                        "', row " & (i + 1) & _
                         ", predecessor: " & CStr(part)
 
                 ParseLink CStr(part), tasks(i).ProjectFile, _
                           predKey, linkType, linkLag
 
                 If Not byKey.Exists(predKey) Then
-                    StopAudit "Predecessor not found: " & predKey & _
+                    StopAudit _
+                        "Predecessor not found: " & predKey & _
                         vbCrLf & _
                         "Check the project path, source UID mapping, " & _
                         "and whether the real source task was exported."
@@ -137,11 +212,13 @@ Public Sub AuditRemovalOfTaskLinks()
 
                 predecessor = CLng(byKey(predKey))
 
-                edgeKey = tasks(predecessor).Key & vbTab & tasks(i).Key
+                edgeKey = tasks(predecessor).Key & _
+                          vbTab & tasks(i).Key
 
                 If seenEdges.Exists(edgeKey) Then
                     StopAudit "Duplicate dependency: " & _
-                        tasks(predecessor).Key & " -> " & tasks(i).Key
+                              tasks(predecessor).Key & _
+                              " -> " & tasks(i).Key
                 End If
 
                 seenEdges.Add edgeKey, True
@@ -151,6 +228,7 @@ Public Sub AuditRemovalOfTaskLinks()
                             " [" & linkType & linkLag & "]"
 
                 With tasks(i)
+
                     .PredCount = .PredCount + 1
 
                     If Right$(linkType, 1) = "S" Then
@@ -162,6 +240,7 @@ Public Sub AuditRemovalOfTaskLinks()
                     If predecessor = selected Then
 
                         .RemovedCount = .RemovedCount + 1
+
                         .RemovedLinks = AppendItem( _
                             .RemovedLinks, linkLabel)
 
@@ -172,25 +251,45 @@ Public Sub AuditRemovalOfTaskLinks()
                         End If
 
                     Else
-                        .KeptLinks = AppendItem(.KeptLinks, linkLabel)
+
+                        .KeptLinks = AppendItem( _
+                            .KeptLinks, linkLabel)
+
                     End If
+
                 End With
+
             Next part
+
         End If
+
     Next i
 
+    '------------------------------------------------------------
+    'Check for cycles and find all downstream tasks.
+    '------------------------------------------------------------
     stage = "Checking and tracing the dependency graph"
+
     ValidateAndTrace tasks, successors, selected
 
-    stage = "Writing the report"
+    '------------------------------------------------------------
+    'Write the report to the selected export workbook.
+    '------------------------------------------------------------
+    stage = "Writing the report in workbook: " & wb.Name
+
     WriteReport wb, tasks, selected, successors(selected).Count
 
     Exit Sub
 
 Failed:
-    MsgBox "Audit stopped. No source tasks or links were changed." & _
-           vbCrLf & vbCrLf & stage & vbCrLf & Err.Description, _
-           vbExclamation, "Task link audit"
+
+    MsgBox _
+        "Audit stopped. No source tasks or links were changed." & _
+        vbCrLf & vbCrLf & _
+        "Stage: " & stage & vbCrLf & _
+        "Error " & Err.Number & ": " & Err.Description, _
+        vbExclamation, _
+        "Task link audit"
 
 End Sub
 
@@ -199,11 +298,17 @@ Private Function AskForTask( _
     ByVal byKey As Object) As Long
 
     Dim answer As Variant
-    Dim s As String, key As String, uid As String
+    Dim s As String
+    Dim key As String
+    Dim uid As String
+
     Dim separatorAt As Long
-    Dim i As Long, hits As Long, found As Long
+    Dim i As Long
+    Dim hits As Long
+    Dim found As Long
 
     Do
+
         answer = Application.InputBox( _
             Prompt:="Enter a Unique ID, or Project|UniqueID." & _
                     vbCrLf & _
@@ -217,8 +322,10 @@ Private Function AskForTask( _
         separatorAt = InStrRev(s, "|")
 
         If separatorAt > 0 Then
-            key = TaskKey(Left$(s, separatorAt - 1), _
-                          Mid$(s, separatorAt + 1))
+
+            key = TaskKey( _
+                Left$(s, separatorAt - 1), _
+                Mid$(s, separatorAt + 1))
 
             If byKey.Exists(key) Then
                 AskForTask = CLng(byKey(key))
@@ -227,7 +334,9 @@ Private Function AskForTask( _
 
             MsgBox "That project/UID combination was not found.", _
                    vbExclamation
+
         Else
+
             uid = UIDText(s)
             hits = 0
             found = 0
@@ -240,17 +349,28 @@ Private Function AskForTask( _
             Next i
 
             If hits = 1 Then
+
                 AskForTask = found
                 Exit Function
+
             ElseIf hits = 0 Then
-                MsgBox "That Unique ID was not found.", vbExclamation
+
+                MsgBox "That Unique ID was not found.", _
+                       vbExclamation
+
             Else
-                MsgBox "That UID exists in more than one project." & _
-                       vbCrLf & _
-                       "Enter the project identifier from column A, " & _
-                       "followed by | and the UID.", vbExclamation
+
+                MsgBox _
+                    "That UID exists in more than one project." & _
+                    vbCrLf & _
+                    "Enter the project identifier from column A, " & _
+                    "followed by | and the UID.", _
+                    vbExclamation
+
             End If
+
         End If
+
     Loop
 
 End Function
@@ -262,16 +382,25 @@ Private Sub ParseLink( _
     ByRef linkType As String, _
     ByRef linkLag As String)
 
-    Dim projectFile As String, reference As String
-    Dim uid As String, remainder As String, character As String
-    Dim slashAt As Long, position As Long
+    Dim projectFile As String
+    Dim reference As String
+    Dim uid As String
+    Dim remainder As String
+    Dim character As String
+
+    Dim slashAt As Long
+    Dim position As Long
 
     token = Trim$(Replace(token, "/", "\"))
-    If Len(token) = 0 Then StopAudit "Empty predecessor entry."
+
+    If Len(token) = 0 Then
+        StopAudit "Empty predecessor entry."
+    End If
 
     'The final backslash separates an external project from its UID.
     projectFile = ownerProject
     reference = token
+
     slashAt = InStrRev(token, "\")
 
     If slashAt > 0 Then
@@ -279,13 +408,17 @@ Private Sub ParseLink( _
         reference = Trim$(Mid$(token, slashAt + 1))
     End If
 
-    'Read only the leading UID digits. Do not absorb lag digits.
+    'Read only the leading UID digits, not any lag digits.
     position = 1
 
     Do While position <= Len(reference)
+
         character = Mid$(reference, position, 1)
+
         If character < "0" Or character > "9" Then Exit Do
+
         position = position + 1
+
     Loop
 
     If position = 1 Then
@@ -295,25 +428,32 @@ Private Sub ParseLink( _
     uid = Left$(reference, position - 1)
     remainder = Trim$(Mid$(reference, position))
 
-    'Project's default dependency is FS with zero lag.
+    'Default relationship is FS.
     linkType = "FS"
 
     Select Case UCase$(Left$(remainder, 2))
+
         Case "FS", "SS", "FF", "SF"
             linkType = UCase$(Left$(remainder, 2))
             remainder = Trim$(Mid$(remainder, 3))
+
     End Select
 
-    'Preserve lag/lead as text; this audit does not calculate dates.
+    'Preserve lag/lead as text. This audit does not calculate dates.
     linkLag = remainder
 
     If Len(linkLag) > 0 Then
+
         If (Left$(linkLag, 1) <> "+" And _
             Left$(linkLag, 1) <> "-") Or Len(linkLag) = 1 Then
-            StopAudit "Unsupported dependency suffix: " & token & _
-                      vbCrLf & _
-                      "Expected FS, SS, FF or SF with optional +/-lag."
+
+            StopAudit _
+                "Unsupported dependency suffix: " & token & _
+                vbCrLf & _
+                "Expected FS, SS, FF or SF with optional +/-lag."
+
         End If
+
     End If
 
     predKey = TaskKey(projectFile, uid)
@@ -325,32 +465,46 @@ Private Sub ValidateAndTrace( _
     ByRef successors() As Collection, _
     ByVal selected As Long)
 
-    Dim queue() As Long, incoming() As Long
-    Dim n As Long, i As Long, current As Long, nextTask As Long
-    Dim head As Long, tail As Long
+    Dim queue() As Long
+    Dim incoming() As Long
+
+    Dim n As Long
+    Dim i As Long
+    Dim current As Long
+    Dim nextTask As Long
+    Dim head As Long
+    Dim tail As Long
+
     Dim child As Variant
 
     n = UBound(tasks)
+
     ReDim queue(1 To n)
     ReDim incoming(1 To n)
 
-    'Topological check: fail if the exported graph contains a cycle.
+    '------------------------------------------------------------
+    'Topological check: stop if the exported graph has a cycle.
+    '------------------------------------------------------------
     For i = 1 To n
+
         incoming(i) = tasks(i).PredCount
 
         If incoming(i) = 0 Then
             tail = tail + 1
             queue(tail) = i
         End If
+
     Next i
 
     head = 1
 
     Do While head <= tail
+
         current = queue(head)
         head = head + 1
 
         For Each child In successors(current)
+
             nextTask = CLng(child)
             incoming(nextTask) = incoming(nextTask) - 1
 
@@ -358,16 +512,22 @@ Private Sub ValidateAndTrace( _
                 tail = tail + 1
                 queue(tail) = nextTask
             End If
+
         Next child
+
     Loop
 
     If tail <> n Then
-        StopAudit "A dependency cycle exists in the exported graph." & _
-                  vbCrLf & "Investigate the logic or export mapping."
+        StopAudit _
+            "A dependency cycle exists in the exported graph." & _
+            vbCrLf & _
+            "Investigate the logic or export mapping."
     End If
 
-    'Breadth-first traversal of the ORIGINAL graph.
-    'Depth is the shortest number of links from the selected task.
+    '------------------------------------------------------------
+    'Breadth-first traversal of the original graph.
+    'Depth is the shortest link count from the selected task.
+    '------------------------------------------------------------
     For i = 1 To n
         tasks(i).Depth = -1
         tasks(i).Via = 0
@@ -375,24 +535,31 @@ Private Sub ValidateAndTrace( _
 
     head = 1
     tail = 1
+
     queue(1) = selected
     tasks(selected).Depth = 0
 
     Do While head <= tail
+
         current = queue(head)
         head = head + 1
 
         For Each child In successors(current)
+
             nextTask = CLng(child)
 
             If tasks(nextTask).Depth = -1 Then
+
                 tasks(nextTask).Depth = tasks(current).Depth + 1
                 tasks(nextTask).Via = current
 
                 tail = tail + 1
                 queue(tail) = nextTask
+
             End If
+
         Next child
+
     Loop
 
 End Sub
@@ -404,45 +571,67 @@ Private Sub WriteReport( _
     ByVal originalSuccessors As Long)
 
     Dim ws As Worksheet
-    Dim output() As Variant, headers As Variant
-    Dim n As Long, i As Long, j As Long
-    Dim relationship As String, impact As String
+
+    Dim output() As Variant
+    Dim headers As Variant
+
+    Dim n As Long
+    Dim i As Long
+    Dim j As Long
+
+    Dim relationship As String
+    Dim impact As String
     Dim reportName As String
 
     n = UBound(tasks)
+
     ReDim output(1 To n, 1 To 15)
 
     For i = 1 To n
+
         With tasks(i)
 
             If i = selected Then
+
                 relationship = "Selected task"
 
                 If originalSuccessors = 0 Then
-                    impact = "Nothing removed: no outgoing links exist."
+                    impact = _
+                        "Nothing removed: no outgoing links exist."
                 Else
-                    impact = "New open end: no successors remain. Review."
+                    impact = _
+                        "New open end: no successors remain. Review."
                 End If
 
             ElseIf .RemovedCount > 0 Then
+
                 relationship = "Direct successor"
 
                 If .PredCount = .RemovedCount Then
-                    impact = "DANGLING / OPEN START: " & _
-                             "no predecessor links remain. Review."
+                    impact = _
+                        "DANGLING / OPEN START: " & _
+                        "no predecessor links remain. Review."
                 Else
-                    impact = "Direct logic change; " & _
-                             "other predecessors remain."
+                    impact = _
+                        "Direct logic change; " & _
+                        "other predecessors remain."
                 End If
 
             ElseIf .Depth > 0 Then
+
                 relationship = "Indirect successor"
-                impact = "Own links unchanged; upstream logic removed. " & _
-                         "Indirect schedule impact is possible."
+
+                impact = _
+                    "Own links unchanged; upstream logic removed. " & _
+                    "Indirect schedule impact is possible."
 
             Else
+
                 relationship = "Not downstream"
-                impact = "No dependency-path impact in exported graph."
+
+                impact = _
+                    "No dependency-path impact in exported graph."
+
             End If
 
             output(i, 1) = .ProjectFile
@@ -450,7 +639,9 @@ Private Sub WriteReport( _
             output(i, 3) = .Title
             output(i, 4) = relationship
 
-            If .Depth >= 0 Then output(i, 5) = .Depth
+            If .Depth >= 0 Then
+                output(i, 5) = .Depth
+            End If
 
             output(i, 6) = .PredCount
             output(i, 7) = .RemovedCount
@@ -459,8 +650,11 @@ Private Sub WriteReport( _
             output(i, 9) = CellText(.RemovedLinks)
             output(i, 10) = CellText(.KeptLinks)
 
-            output(i, 11) = SideCheck(.StartCount, .RemovedStart)
-            output(i, 12) = SideCheck(.FinishCount, .RemovedFinish)
+            output(i, 11) = SideCheck( _
+                .StartCount, .RemovedStart)
+
+            output(i, 12) = SideCheck( _
+                .FinishCount, .RemovedFinish)
 
             output(i, 13) = impact
 
@@ -475,29 +669,47 @@ Private Sub WriteReport( _
             If .Via > 0 Then
                 output(i, 15) = tasks(.Via).Key
             End If
+
         End With
+
     Next i
 
     reportName = NextReportName(wb)
-    Set ws = wb.Worksheets.Add(After:=wb.Sheets(wb.Sheets.Count))
+
+    Set ws = wb.Worksheets.Add( _
+        After:=wb.Sheets(wb.Sheets.Count))
+
     ws.Name = reportName
 
     headers = Array( _
-        "Project", "Unique ID", "Name", "Relationship", "Hops", _
-        "Predecessors before", "Links removed", "Predecessors after", _
-        "Removed predecessor links", "Remaining predecessor links", _
-        "FS/SS links: before -> after", "FF/SF links: before -> after", _
-        "Logic impact", "Schedule impact", "Trace via task key")
+        "Project", _
+        "Unique ID", _
+        "Name", _
+        "Relationship", _
+        "Hops", _
+        "Predecessors before", _
+        "Links removed", _
+        "Predecessors after", _
+        "Removed predecessor links", _
+        "Remaining predecessor links", _
+        "FS/SS links: before -> after", _
+        "FF/SF links: before -> after", _
+        "Logic impact", _
+        "Schedule impact", _
+        "Trace via task key")
 
     With ws
-        .Cells(1, 1).Value2 = "Task link-removal audit - " & _
-                             Format$(Now, "yyyy-mm-dd hh:nn:ss")
 
-        .Cells(2, 1).Value2 = "Selected task: " & tasks(selected).Key & _
-                             " - " & tasks(selected).Title
+        .Cells(1, 1).Value2 = _
+            "Task link-removal audit - " & _
+            Format$(Now, "yyyy-mm-dd hh:nn:ss")
 
-        .Cells(3, 1).Value2 = "Scenario: remove all " & _
-            originalSuccessors & _
+        .Cells(2, 1).Value2 = _
+            "Selected task: " & tasks(selected).Key & _
+            " - " & tasks(selected).Title
+
+        .Cells(3, 1).Value2 = _
+            "Scenario: remove all " & originalSuccessors & _
             " outgoing links; retain the task and all incoming links."
 
         .Cells(4, 1).Value2 = _
@@ -508,14 +720,18 @@ Private Sub WriteReport( _
             .Cells(6, j + 1).Value2 = headers(j)
         Next j
 
-        'Write source-derived text as text, not as Excel formulas.
+        'Treat source-derived text as text, not Excel formulas.
         .Cells(7, 1).Resize(n, 15).NumberFormat = "@"
         .Cells(7, 5).Resize(n, 4).NumberFormat = "0"
+
         .Cells(7, 1).Resize(n, 15).Value2 = output
 
-        .Range(.Cells(6, 1), .Cells(n + 6, 15)).AutoFilter
+        .Range( _
+            .Cells(6, 1), _
+            .Cells(n + 6, 15)).AutoFilter
 
         .Rows(6).Font.Bold = True
+
         .Columns("A:O").ColumnWidth = 20
         .Columns("C").ColumnWidth = 32
         .Columns("I:J").ColumnWidth = 45
@@ -528,12 +744,16 @@ Private Sub WriteReport( _
         End With
 
         .Activate
+
     End With
 
-    MsgBox "Report created: " & reportName & vbCrLf & _
-           "Filter Relationship to Direct successor and Indirect " & _
-           "successor for the downstream task list.", _
-           vbInformation, "Task link audit"
+    MsgBox _
+        "Report created in " & wb.Name & ": " & reportName & _
+        vbCrLf & vbCrLf & _
+        "Filter Relationship to Direct successor and Indirect " & _
+        "successor for the downstream task list.", _
+        vbInformation, _
+        "Task link audit"
 
 End Sub
 
@@ -548,8 +768,10 @@ Private Function TaskKey( _
     End If
 
     If InStr(projectFile, LIST_SEPARATOR) > 0 Then
-        StopAudit "A project identifier contains the list separator." & _
-                  vbCrLf & "This export format needs a different parser."
+        StopAudit _
+            "A project identifier contains the list separator." & _
+            vbCrLf & _
+            "This export format needs a different parser."
     End If
 
     TaskKey = projectFile & "|" & UIDText(uid)
@@ -559,10 +781,12 @@ End Function
 Private Function UIDText(ByVal value As Variant) As String
 
     Dim s As String
+
     s = TextValue(value)
 
     If Len(s) = 0 Or s Like "*[!0-9]*" Then
-        StopAudit "Unique IDs must contain digits only. Found: " & s
+        StopAudit _
+            "Unique IDs must contain digits only. Found: " & s
     End If
 
     Do While Len(s) > 1 And Left$(s, 1) = "0"
@@ -611,7 +835,7 @@ Private Function CellText(ByVal value As String) As String
 
     If Len(value) > 32760 Then
         CellText = Left$(value, 32700) & vbLf & _
-                   "[Truncated - see Tasks export]"
+                   "[Truncated - see source export]"
     Else
         CellText = value
     End If
@@ -620,12 +844,14 @@ End Function
 
 Private Function NextReportName(ByVal wb As Workbook) As String
 
-    Dim number As Long, candidate As String
+    Dim number As Long
+    Dim candidate As String
     Dim sheet As Object
 
     number = 1
 
     Do
+
         candidate = "LinkImpact_" & Format$(number, "000")
         Set sheet = Nothing
 
@@ -639,6 +865,7 @@ Private Function NextReportName(ByVal wb As Workbook) As String
         End If
 
         number = number + 1
+
     Loop
 
 End Function
