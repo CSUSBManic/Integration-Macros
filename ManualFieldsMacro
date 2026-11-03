@@ -7,16 +7,18 @@ Sub SnapshotSlackAndDates()
     Application.ScreenUpdating = False
     
     ' 2. Instantly copy Start/Finish to Start1/Finish1 using native Interim Plan engine
-    BaselineSave All:=True, Copy:=pjCopyStartFinish, Into:=pjIntoStart1Finish1
+    BaselineSave All:=True, Copy:=pjCopyCurrent, Into:=pjIntoStart_Finish1
     
     ' 3. Loop through tasks to copy static Total Slack (in days) into Number18
     minsPerDay = ActiveProject.HoursPerDay * 60
     
+    On Error Resume Next ' Prevents crashes if a task is unscheduled/blank
     For Each t In ActiveProject.Tasks
         If Not t Is Nothing Then
             t.Number18 = t.TotalSlack / minsPerDay
         End If
     Next t
+    On Error GoTo 0
     
     ' 4. Restore settings and alert when finished
     Application.ScreenUpdating = True
