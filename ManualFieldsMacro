@@ -1,0 +1,26 @@
+Sub SnapshotSlackAndDates()
+    Dim t As Task
+    Dim minsPerDay As Double
+    
+    ' 1. Freeze screen and auto-calculation for maximum speed on 20k+ rows
+    Application.Calculation = pjManual
+    Application.ScreenUpdating = False
+    
+    ' 2. Instantly copy Start/Finish to Start1/Finish1 using native Interim Plan engine
+    BaselineSave All:=True, Copy:=pjCopyStartFinish, Into:=pjIntoStart1Finish1
+    
+    ' 3. Loop through tasks to copy static Total Slack (in days) into Number18
+    minsPerDay = ActiveProject.HoursPerDay * 60
+    
+    For Each t In ActiveProject.Tasks
+        If Not t Is Nothing Then
+            t.Number18 = t.TotalSlack / minsPerDay
+        End If
+    Next t
+    
+    ' 4. Restore settings and alert when finished
+    Application.ScreenUpdating = True
+    Application.Calculation = pjAutomatic
+    
+    MsgBox "Snapshot complete! Static values saved to Number18, Start1, and Finish1.", vbInformation, "Done"
+End Sub
