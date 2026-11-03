@@ -1,0 +1,21 @@
+Sub CopySlackToNumber()
+    Dim t As Task
+    Dim minsPerDay As Double
+    
+    ' Turn off calculation and screen updating for instant execution on 20k+ rows
+    Application.Calculation = pjManual
+    Application.ScreenUpdating = False
+    
+    minsPerDay = ActiveProject.HoursPerDay * 60
+    
+    For Each t In ActiveProject.Tasks
+        If Not t Is Nothing Then
+            ' Converts internal minutes into Days and saves to Number1
+            t.Number7 = t.TotalSlack / minsPerDay
+        End If
+    Next t
+    
+    Application.ScreenUpdating = True
+    Application.Calculation = pjAutomatic
+    MsgBox "Done!"
+End Sub
