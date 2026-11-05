@@ -1,0 +1,42 @@
+Sub FlattenMasterProject()
+    Dim subProj As Subproject
+    Dim t As Task
+    Dim resp As VbMsgBoxResult
+    
+    ' Safety prompt to ensure user isn't doing this on the live Server instance
+    resp = MsgBox("Ensure you have saved a local copy of this Master Project before proceeding. " & vbCrLf & vbCrLf & _
+                  "Do you want to flatten all subprojects and convert cross-project links to local links?", _
+                  vbYesNo + vbExclamation, "Confirm Flatten Project")
+                  
+    If resp = vbNo Then Exit Sub
+    
+    Application.ScreenUpdating = False
+    Application.Calculation = pjManual
+    
+    ' 1. Expand all tasks so subprojects are fully loaded into memory
+    SelectAll
+    OutlineShowAllTasks
+    
+    ' 2. Loop through subprojects backwards and break the link to embed them
+    ' (Project automatically converts cross-project links between subprojects to local links)
+    Dim i As Integer
+    For i = ActiveProject.Subprojects.Count To 1 Step -1
+        Set subProj = ActiveProject.Subprojects(i)
+        subProj.LinkToProject = False
+    Next i
+    
+    ' 3. Clean up any remaining external ghost tasks (links to files NOT in the master)
+    For i = ActiveProject.Tasks.Count To 1 Step -1
+        Set t = ActiveProject.Tasks(i)
+        If Not t Is Nothing Then
+            If t.ExternalTask Then
+                t.Delete
+            End If
+        End If
+    Next i
+    
+    Application.Calculation = pjAutomatic
+    Application.ScreenUpdating = True
+    
+    MsgBox "Master Project has been flattened and all internal cross-project links are now local!", vbInformation, "Success"
+End Sub
