@@ -3,6 +3,10 @@ Sub FlattenMasterProject()
     Dim t As Task
     Dim resp As VbMsgBoxResult
     Dim i As Long
+    Dim totalSub As Long
+    Dim totalTasks As Long
+    Dim currentStep As Long
+    Dim pctDone As Double
     
     ' Safety prompt to ensure user isn't doing this on the live Server instance
     resp = MsgBox("Ensure you have saved a local copy of this Master Project before proceeding. " & vbCrLf & vbCrLf & _
@@ -11,37 +15,73 @@ Sub FlattenMasterProject()
                   
     If resp = vbNo Then Exit Sub
     
+    ' Turn off screen updating, alerts, and automatic calculation for maximum speed
     Application.ScreenUpdating = False
     Application.Calculation = pjManual
-    
-    ' Temporarily suppress MS Project prompts asking if you want to save changes to subprojects
     Application.DisplayAlerts = False
     
-    ' 1. Expand all tasks so subprojects are fully loaded into memory
+    ' ---------------------------------------------------------
+    ' STEP 1: Expand all tasks so subprojects load into memory
+    ' ---------------------------------------------------------
+    Application.StatusBar = "Step 1 of 3: Expanding all subprojects (this may take a few minutes)..."
+    DoEvents
+    
     SelectAll
     OutlineShowAllTasks
     
-    ' 2. Loop through subprojects backwards and break the link to embed them
-    ' (Project automatically converts cross-project links between subprojects to local links)
-    For i = ActiveProject.Subprojects.Count To 1 Step -1
-        Set subProj = ActiveProject.Subprojects(i)
-        subProj.LinkToSource = False
-    Next i
+    ' ---------------------------------------------------------
+    ' STEP 2: Unlink and embed subprojects (converts links)
+    ' ---------------------------------------------------------
+    totalSub = ActiveProject.Subprojects.Count
     
-    ' 3. Clean up any remaining external ghost tasks (links to files NOT in the master)
-    For i = ActiveProject.Tasks.Count To 1 Step -1
-        Set t = ActiveProject.Tasks(i)
-        If Not t Is Nothing Then
-            If t.ExternalTask Then
-                t.Delete
+    If totalSub > 0 Then
+        For i = totalSub To 1 Step -1
+            currentStep = totalSub - i + 1
+            pctDone = Round((currentStep / totalSub) * 100, 0)
+            
+            ' Update the status bar in the bottom-left corner
+            Application.StatusBar = "Step 2 of 3: Flattening Subproject " & currentStep & " of " & totalSub & " (" & pctDone & "%)"
+            DoEvents ' Prevents MS Project from freezing / "Not Responding"
+            
+            Set subProj = ActiveProject.Subprojects(i)
+            subProj.LinkToSource = False
+        Next i
+    End If
+    
+    ' ---------------------------------------------------------
+    ' STEP 3: Clean up remaining external ghost tasks
+    ' ---------------------------------------------------------
+    totalTasks = ActiveProject.Tasks.Count
+    
+    If totalTasks > 0 Then
+        For i = totalTasks To 1 Step -1
+            ' Only update the status bar every 250 tasks so we don't slow down the loop
+            If i Mod 250 = 0 Or i = 1 Then
+                currentStep = totalTasks - i + 1
+                pctDone = Round((currentStep / totalTasks) * 100, 0)
+                Application.StatusBar = "Step 3 of 3: Scanning & removing external ghost tasks... " & pctDone & "% (" & i & " tasks left)"
+                DoEvents
             End If
-        End If
-    Next i
+            
+            Set t = ActiveProject.Tasks(i)
+            If Not t Is Nothing Then
+                If t.ExternalTask Then
+                    t.Delete
+                End If
+            End If
+        Next i
+    End If
     
-    ' Restore default settings
+    ' ---------------------------------------------------------
+    ' CLEANUP: Restore settings and perform final calculation
+    ' ---------------------------------------------------------
+    Application.StatusBar = "Finalizing: Recalculating flattened project schedule..."
+    DoEvents
+    
     Application.DisplayAlerts = True
-    Application.Calculation = pjAutomatic
+    Application.Calculation = pjAutomatic ' Put an apostrophe in front of this line if you want to skip the final calculation
     Application.ScreenUpdating = True
+    Application.StatusBar = False ' Resets the status bar back to normal ("Ready")
     
     MsgBox "Master Project has been flattened and all internal cross-project links are now local!", vbInformation, "Success"
 End Sub
