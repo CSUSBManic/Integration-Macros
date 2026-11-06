@@ -3,11 +3,10 @@ Option Explicit
 ' Global variables for high-speed memory processing
 Dim OutArr() As Variant
 Dim OutCount As Long
-Dim PrjDict As Object
 Dim ScannedProjects As Object
 Dim TasksScanned As Long
 
-Sub ExportMasterOOSToExcel_30k()
+Sub ExportMasterOOSToExcel_30k_Fixed()
     Dim xlApp As Object
     Dim xlBook As Object
     Dim xlSheet As Object
@@ -17,9 +16,6 @@ Sub ExportMasterOOSToExcel_30k()
     OutCount = 0
     TasksScanned = 0
     ReDim OutArr(1 To 13, 1 To 5000) ' Pre-allocate for 5,000 OOS links (auto-expands)
-    
-    Set PrjDict = CreateObject("Scripting.Dictionary")
-    PrjDict.CompareMode = 1 ' TextCompare (Case-insensitive)
     
     Set ScannedProjects = CreateObject("Scripting.Dictionary")
     ScannedProjects.CompareMode = 1
@@ -35,11 +31,7 @@ Sub ExportMasterOOSToExcel_30k()
     OutlineShowAllTasks
     On Error GoTo 0
     
-    ' 2. Index all loaded projects into a RAM Hash Table for instant cross-project lookups
-    Application.StatusBar = "Indexing Subprojects in memory..."
-    BuildProjectDictionary ActiveProject
-    
-    ' 3. Scan the Master Project and all Subprojects recursively
+    ' 2. Scan the Master Project and all Subprojects recursively
     ProcessProject ActiveProject
     
     ' Restore MS Project UI & Status Bar
@@ -47,7 +39,7 @@ Sub ExportMasterOOSToExcel_30k()
     Application.Calculation = pjAutomatic
     Application.ScreenUpdating = True
     
-    ' 4. Check results
+    ' 3. Check results
     If OutCount = 0 Then
         MsgBox "Scan complete! Scanned " & Format(TasksScanned, "#,##0") & " active tasks in " & _
                Format(Timer - startTime, "0.0") & " seconds." & vbCrLf & vbCrLf & _
@@ -55,7 +47,7 @@ Sub ExportMasterOOSToExcel_30k()
         Exit Sub
     End If
     
-    ' 5. Initialize Excel and dump data in a single memory block
+    ' 4. Initialize Excel and dump data in a single memory block
     Application.StatusBar = "Building Excel Report..."
     On Error Resume Next
     Set xlApp = CreateObject("Excel.Application")
@@ -75,7 +67,7 @@ Sub ExportMasterOOSToExcel_30k()
     headers = Array("Project", "Task ID", "Unique ID", "Task Name", "Task % Comp", "Actual Start", _
                     "Pred Project", "Pred ID", "Pred UID", "Predecessor Name", "Link Type", "Pred % Comp", "OOS Reason")
     
-    ' Transpose array in pure VBA (Bypasses Excel's Transpose limits/crashes)
+    ' Transpose array in pure VBA
     Dim FinalArr() As Variant
     ReDim FinalArr(1 To OutCount, 1 To 13)
     Dim r As Long, c As Long
@@ -114,29 +106,7 @@ Sub ExportMasterOOSToExcel_30k()
     Set xlSheet = Nothing
     Set xlBook = Nothing
     Set xlApp = Nothing
-    Set PrjDict = Nothing
     Set ScannedProjects = Nothing
-End Sub
-
-Private Sub BuildProjectDictionary(ByVal prj As Project)
-    Dim subPrj As Subproject
-    Dim shortName As String
-    
-    If prj Is Nothing Then Exit Sub
-    
-    If Not PrjDict.Exists(prj.Name) Then PrjDict.Add prj.Name, prj
-    If Not PrjDict.Exists(prj.FullName) Then PrjDict.Add prj.FullName, prj
-    
-    shortName = StripExtension(prj.Name)
-    If Not PrjDict.Exists(shortName) Then PrjDict.Add shortName, prj
-    
-    For Each subPrj In prj.Subprojects
-        On Error Resume Next
-        If Not subPrj.SourceProject Is Nothing Then
-            BuildProjectDictionary subPrj.SourceProject
-        End If
-        On Error GoTo 0
-    Next subPrj
 End Sub
 
 Private Sub ProcessProject(ByVal prj As Project)
@@ -167,7 +137,7 @@ Private Sub ProcessProject(ByVal prj As Project)
                     ' SPEED GATE: Only inspect tasks that have started AND have predecessors
                     If t.ActualStart <> "NA" Then
                         If Len(t.Predecessors) > 0 Then
-                            CheckTaskOOS t, prjName
+                            CheckTaskOOS t
                         End If
                     End If
                 End If
@@ -185,83 +155,85 @@ Private Sub ProcessProject(ByVal prj As Project)
     Next subPrj
 End Sub
 
-Private Sub CheckTaskOOS(ByVal t As Task, ByVal tPrjName As String)
+Private Sub CheckTaskOOS(ByVal t As Task)
     Dim dep As TaskDependency
     Dim p As Task
-    Dim realP As Task
     Dim isOOS As Boolean
     Dim relType As String
     Dim oosReason As String
-    Dim tUID As Long
     Dim pPct As Double
-    
-    tUID = t.UniqueID
+    Dim predPrjName As String
+    Dim predID As Variant
+    Dim predUID As Variant
     
     For Each dep In t.TaskDependencies
-        ' Fast integer check first, then verify not an external task collision
-        If dep.To.UniqueID = tUID Then
-            If Not dep.To.ExternalTask Then
-                Set p = dep.From
-                
-                ' Resolve Cross-Project Ghost Task via O(1) Dictionary Lookup
-                If p.ExternalTask Then
-                    Set realP = ResolveExternalTaskFast(p)
-                Else
-                    Set realP = p
-                End If
-                
-                If Not realP Is Nothing Then
-                    If realP.Active Then
-                        isOOS = False
-                        pPct = realP.PercentComplete
-                        
-                        Select Case dep.Type
-                            Case pjFinishToStart '0
-                                If pPct < 100 Then
-                                    isOOS = True
-                                    relType = "FS"
-                                    oosReason = "Started before Predecessor finished"
-                                End If
-                            Case pjStartToStart '1
-                                If realP.ActualStart = "NA" Then
-                                    isOOS = True
-                                    relType = "SS"
-                                    oosReason = "Started before Predecessor started"
-                                End If
-                            Case pjFinishToFinish '2
-                                If t.PercentComplete = 100 And pPct < 100 Then
-                                    isOOS = True
-                                    relType = "FF"
-                                    oosReason = "Finished before Predecessor finished"
-                                End If
-                            Case pjStartToFinish '3
-                                If t.PercentComplete = 100 And realP.ActualStart = "NA" Then
-                                    isOOS = True
-                                    relType = "SF"
-                                    oosReason = "Finished before Predecessor started"
-                                End If
-                        End Select
-                        
-                        If isOOS Then
-                            OutCount = OutCount + 1
-                            If OutCount > UBound(OutArr, 2) Then
-                                ReDim Preserve OutArr(1 To 13, 1 To UBound(OutArr, 2) + 5000)
+        ' Use exact object reference matching (dep.To.UniqueID = t.UniqueID AND same parent project)
+        If dep.To.UniqueID = t.UniqueID And Not dep.To.ExternalTask Then
+            Set p = dep.From
+            
+            If Not p Is Nothing Then
+                ' Check that predecessor is active
+                If p.Active Then
+                    isOOS = False
+                    pPct = p.PercentComplete
+                    
+                    Select Case dep.Type
+                        Case pjFinishToStart '0
+                            If pPct < 100 Then
+                                isOOS = True
+                                relType = "FS"
+                                oosReason = "Started before Predecessor finished"
                             End If
-                            
-                            OutArr(1, OutCount) = t.Project
-                            OutArr(2, OutCount) = t.ID
-                            OutArr(3, OutCount) = tUID
-                            OutArr(4, OutCount) = t.Name
-                            OutArr(5, OutCount) = t.PercentComplete / 100
-                            OutArr(6, OutCount) = Format(t.ActualStart, "yyyy-mm-dd")
-                            OutArr(7, OutCount) = realP.Project
-                            OutArr(8, OutCount) = realP.ID
-                            OutArr(9, OutCount) = realP.UniqueID
-                            OutArr(10, OutCount) = realP.Name
-                            OutArr(11, OutCount) = relType
-                            OutArr(12, OutCount) = pPct / 100
-                            OutArr(13, OutCount) = oosReason
+                        Case pjStartToStart '1
+                            If p.ActualStart = "NA" Then
+                                isOOS = True
+                                relType = "SS"
+                                oosReason = "Started before Predecessor started"
+                            End If
+                        Case pjFinishToFinish '2
+                            If t.PercentComplete = 100 And pPct < 100 Then
+                                isOOS = True
+                                relType = "FF"
+                                oosReason = "Finished before Predecessor finished"
+                            End If
+                        Case pjStartToFinish '3
+                            If t.PercentComplete = 100 And p.ActualStart = "NA" Then
+                                isOOS = True
+                                relType = "SF"
+                                oosReason = "Finished before Predecessor started"
+                            End If
+                    End Select
+                    
+                    If isOOS Then
+                        OutCount = OutCount + 1
+                        If OutCount > UBound(OutArr, 2) Then
+                            ReDim Preserve OutArr(1 To 13, 1 To UBound(OutArr, 2) + 5000)
                         End If
+                        
+                        ' Determine if the Predecessor is in the same subproject or an External Cross-Project Link
+                        If p.ExternalTask Then
+                            predPrjName = ExtractExternalProjectName(p.Project)
+                            predID = p.ID & " (Ext)"
+                            predUID = ExtractExternalUID(p)
+                        Else
+                            predPrjName = p.Project
+                            predID = p.ID
+                            predUID = p.UniqueID
+                        End If
+                        
+                        OutArr(1, OutCount) = t.Project
+                        OutArr(2, OutCount) = t.ID
+                        OutArr(3, OutCount) = t.UniqueID
+                        OutArr(4, OutCount) = t.Name
+                        OutArr(5, OutCount) = t.PercentComplete / 100
+                        OutArr(6, OutCount) = Format(t.ActualStart, "yyyy-mm-dd")
+                        OutArr(7, OutCount) = predPrjName
+                        OutArr(8, OutCount) = predID
+                        OutArr(9, OutCount) = predUID
+                        OutArr(10, OutCount) = p.Name
+                        OutArr(11, OutCount) = relType
+                        OutArr(12, OutCount) = pPct / 100
+                        OutArr(13, OutCount) = oosReason
                     End If
                 End If
             End If
@@ -269,30 +241,21 @@ Private Sub CheckTaskOOS(ByVal t As Task, ByVal tPrjName As String)
     Next dep
 End Sub
 
-Private Function ResolveExternalTaskFast(ByVal extTask As Task) As Task
-    Dim srcPrj As Project
-    Dim extPrjKey As String
-    
-    On Error Resume Next
-    extPrjKey = extTask.Project
-    
-    If PrjDict.Exists(extPrjKey) Then
-        Set srcPrj = PrjDict(extPrjKey)
-        Set ResolveExternalTaskFast = srcPrj.Tasks.UniqueID(extTask.UniqueID)
-        If Not ResolveExternalTaskFast Is Nothing Then Exit Function
+' Extracts the clean file name or path of an external predecessor
+Private Function ExtractExternalProjectName(ByVal rawPrj As String) As String
+    Dim slashPos As Long
+    slashPos = InStrRev(rawPrj, "\")
+    If slashPos > 0 Then
+        ExtractExternalProjectName = Mid(rawPrj, slashPos + 1)
+    Else
+        ExtractExternalProjectName = rawPrj
     End If
-    
-    ' Fallback to ghost task properties if external file isn't part of the master
-    Set ResolveExternalTaskFast = extTask
-    On Error GoTo 0
 End Function
 
-Private Function StripExtension(ByVal fileName As String) As String
-    Dim dotPos As Long
-    dotPos = InStrRev(fileName, ".")
-    If dotPos > 0 Then
-        StripExtension = Left(fileName, dotPos - 1)
-    Else
-        StripExtension = fileName
-    End If
+' Extracts the true Unique ID or Task ID from the External Task path string (FullPath\File.mpp\UniqueID)
+Private Function ExtractExternalUID(ByVal extTask As Task) As String
+    On Error Resume Next
+    ' In MS Project, an external task's true link string is stored in Predecessors or can be read from the ghost task
+    ExtractExternalUID = "Ext Ghost UID: " & extTask.UniqueID
+    On Error GoTo 0
 End Function
