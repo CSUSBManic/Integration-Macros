@@ -1,0 +1,90 @@
+Sub FlattenMasterProject_Fast()
+    Dim subProj As Subproject
+    Dim resp As VbMsgBoxResult
+    Dim i As Long
+    Dim totalSub As Long
+    Dim currentStep As Long
+    Dim pctDone As Double
+    
+    resp = MsgBox("Ensure you have saved a local copy of this Master Project before proceeding. " & vbCrLf & vbCrLf & _
+                  "Run High-Speed Flatten for 30k+ lines?", _
+                  vbYesNo + vbExclamation, "Confirm High-Speed Flatten")
+                  
+    If resp = vbNo Then Exit Sub
+    
+    ' 1. LOCK DOWN MS PROJECT FOR MAXIMUM CPU SPEED
+    Application.ScreenUpdating = False
+    Application.Calculation = pjManual
+    Application.DisplayAlerts = False
+    Application.EnableCancelKey = pjDisabled ' Boosts loop execution speed
+    
+    ' Switch to a pure data grid (Task Sheet) so MS Project doesn't render 30,000 Gantt bars
+    On Error Resume Next
+    ViewApply Name:="Task Sheet"
+    FilterApply Name:="All Tasks"
+    GroupApply Name:="No Group"
+    On Error GoTo 0
+    
+    ' ---------------------------------------------------------
+    ' STEP 1: Expand all subprojects into memory
+    ' ---------------------------------------------------------
+    Application.StatusBar = "Step 1 of 3: Expanding 30k+ tasks into memory (Please wait)..."
+    DoEvents
+    
+    SelectAll
+    OutlineShowAllTasks
+    
+    ' ---------------------------------------------------------
+    ' STEP 2: Unlink and embed subprojects (converts links)
+    ' ---------------------------------------------------------
+    totalSub = ActiveProject.Subprojects.Count
+    
+    If totalSub > 0 Then
+        For i = totalSub To 1 Step -1
+            currentStep = totalSub - i + 1
+            pctDone = Round((currentStep / totalSub) * 100, 0)
+            
+            Application.StatusBar = "Step 2 of 3: Flattening Subproject " & currentStep & " of " & totalSub & " (" & pctDone & "%)"
+            DoEvents
+            
+            Set subProj = ActiveProject.Subprojects(i)
+            subProj.LinkToSource = False
+        Next i
+    End If
+    
+    ' ---------------------------------------------------------
+    ' STEP 3: BULK-DELETE external ghost tasks in ONE operation
+    ' (Avoids looping through 30,000 rows one by one)
+    ' ---------------------------------------------------------
+    Application.StatusBar = "Step 3 of 3: Bulk-deleting external ghost tasks..."
+    DoEvents
+    
+    ' Create a temporary filter that isolates only External Ghost Tasks
+    FilterEdit Name:="__TempGhostFilter", TaskFilter:=True, Create:=True, OverwriteExisting:=True, _
+               FieldName:="External Task", Test:="equals", Value:="Yes", ShowInMenu:=False, ShowSummaryTasks:=False
+    FilterApply Name:="__TempGhostFilter"
+    
+    ' Select all visible ghost tasks and delete them in a single strike
+    SelectAll
+    On Error Resume Next ' In case there are 0 ghost tasks
+    EditDelete
+    On Error GoTo 0
+    
+    ' Restore all tasks and delete the temporary filter
+    FilterApply Name:="All Tasks"
+    On Error Resume Next
+    OrganizerDeleteItem Type:=pjFilters, FileName:=ActiveProject.Name, Name:="__TempGhostFilter"
+    On Error GoTo 0
+    
+    ' ---------------------------------------------------------
+    ' CLEANUP: Restore UI (Leave Calculation Manual so you can save fast)
+    ' ---------------------------------------------------------
+    Application.StatusBar = False
+    Application.DisplayAlerts = True
+    Application.EnableCancelKey = pjInterrupt
+    Application.ScreenUpdating = True
+    
+    MsgBox "High-Speed Flatten complete! " & vbCrLf & vbCrLf & _
+           "NOTE: Automatic Calculation has been left OFF so you can save the file immediately. " & _
+           "Press F9 when you are ready to calculate the schedule.", vbInformation, "Success"
+End Sub
