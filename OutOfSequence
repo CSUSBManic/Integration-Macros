@@ -1,96 +1,132 @@
 Option Explicit
 
-' Global variables for high-speed memory processing
 Dim OutArr() As Variant
 Dim OutCount As Long
-Dim ScannedProjects As Object
-Dim TasksScanned As Long
+Dim GhostLookup As Object
 
-Sub ExportMasterOOSToExcel_30k_Fixed()
+Sub ExportMasterOOSToExcel_LiveMaster()
     Dim xlApp As Object
     Dim xlBook As Object
     Dim xlSheet As Object
+    Dim t As Task
     Dim startTime As Double
+    Dim TasksScanned As Long
+    Dim totalTasks As Long
     
     startTime = Timer
     OutCount = 0
     TasksScanned = 0
-    ReDim OutArr(1 To 13, 1 To 5000) ' Pre-allocate for 5,000 OOS links (auto-expands)
+    ReDim OutArr(1 To 15, 1 To 5000)
     
-    Set ScannedProjects = CreateObject("Scripting.Dictionary")
-    ScannedProjects.CompareMode = 1
+    ' Dictionary to map "SubprojectName|SubprojectUID" -> Live Master Task Object
+    Set GhostLookup = CreateObject("Scripting.Dictionary")
+    GhostLookup.CompareMode = 1 ' Case-insensitive
     
-    ' 1. Lock down MS Project UI & Calculation for maximum speed
+    ' 1. Lock down UI for speed and expand all tasks in the Master View
     Application.ScreenUpdating = False
     Application.Calculation = pjManual
     
-    ' Force all collapsed subprojects to load into memory so none are skipped
-    Application.StatusBar = "Expanding Master Schedule to ensure all Subprojects are loaded..."
+    Application.StatusBar = "Expanding Master Schedule so all 30k+ tasks are live in view..."
     On Error Resume Next
-    SelectAll
-    OutlineShowAllTasks
+     OutlineShowAllTasks
     On Error GoTo 0
     
-    ' 2. Scan the Master Project and all Subprojects recursively
-    ProcessProject ActiveProject
+    totalTasks = ActiveProject.Tasks.Count
     
-    ' Restore MS Project UI & Status Bar
+    ' 2. PASS 1: Index all real tasks from the live Master Schedule into RAM
+    ' This guarantees we always read the LIVE 100% complete status shown on your screen,
+    ' never a stale 0% ghost task!
+    Application.StatusBar = "Indexing " & Format(totalTasks, "#,##0") & " Master Schedule tasks in RAM..."
+    Dim subPrj As Subproject
+    Dim subTask As Task
+    Dim prjShortName As String
+    
+    ' Also index each subproject's native UniqueID to its live task so Ghost Tasks can be resolved 100% accurately
+    For Each subPrj In ActiveProject.Subprojects
+        On Error Resume Next
+        If Not subPrj.SourceProject Is Nothing Then
+            prjShortName = StripExtension(subPrj.SourceProject.Name)
+            For Each subTask In subPrj.SourceProject.Tasks
+                If Not subTask Is Nothing Then
+                    If Not subTask.ExternalTask And Not subTask.Summary Then
+                        GhostLookup(prjShortName & "|" & subTask.UniqueID) = subTask
+                        GhostLookup(subPrj.SourceProject.FullName & "|" & subTask.UniqueID) = subTask
+                    End If
+                End If
+            Next subTask
+        End If
+        On Error GoTo 0
+    Next subPrj
+    
+    ' 3. PASS 2: Scan all tasks directly in ActiveProject.Tasks (what you see on screen)
+    For Each t In ActiveProject.Tasks
+        If Not t Is Nothing Then
+            If Not t.Summary And Not t.ExternalTask Then
+                If t.Active Then
+                    TasksScanned = TasksScanned + 1
+                    
+                    If TasksScanned Mod 500 = 0 Then
+                        Application.StatusBar = "Scanning Master Schedule: " & Format(TasksScanned, "#,##0") & _
+                                                " / " & Format(totalTasks, "#,##0") & " | OOS Found: " & OutCount
+                        DoEvents
+                    End If
+                    
+                    ' Only check tasks that have actually started and have predecessors
+                    If t.ActualStart <> "NA" Then
+                        If Len(t.Predecessors) > 0 Then
+                            CheckTaskOOS_Live t
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    Next t
+    
     Application.StatusBar = False
     Application.Calculation = pjAutomatic
     Application.ScreenUpdating = True
     
-    ' 3. Check results
     If OutCount = 0 Then
-        MsgBox "Scan complete! Scanned " & Format(TasksScanned, "#,##0") & " active tasks in " & _
+        MsgBox "Scan complete! Checked " & Format(TasksScanned, "#,##0") & " tasks in " & _
                Format(Timer - startTime, "0.0") & " seconds." & vbCrLf & vbCrLf & _
-               "Great news: 0 Out-of-Sequence relationships found!", vbInformation
+               "0 Out-of-Sequence relationships found!", vbInformation
         Exit Sub
     End If
     
-    ' 4. Initialize Excel and dump data in a single memory block
-    Application.StatusBar = "Building Excel Report..."
-    On Error Resume Next
+    ' 4. Dump results to Excel
+    Application.StatusBar = "Creating Excel Report..."
     Set xlApp = CreateObject("Excel.Application")
-    If Err.Number <> 0 Then
-        Application.StatusBar = False
-        MsgBox "Could not start Excel. Please make sure Excel is installed.", vbCritical
-        Exit Sub
-    End If
-    On Error GoTo 0
-    
     xlApp.ScreenUpdating = False
     Set xlBook = xlApp.Workbooks.Add
     Set xlSheet = xlBook.Sheets(1)
     xlSheet.Name = "Master OOS Report"
     
     Dim headers As Variant
-    headers = Array("Project", "Task ID", "Unique ID", "Task Name", "Task % Comp", "Actual Start", _
-                    "Pred Project", "Pred ID", "Pred UID", "Predecessor Name", "Link Type", "Pred % Comp", "OOS Reason")
+    headers = Array("Subproject", "Task ID (Master)", "Unique ID", "Task Name", "Task % Comp", "Task Actual Start", "Task Actual Finish", _
+                    "Pred Subproject", "Pred ID", "Pred UID", "Predecessor Name", "Link Type", "Pred % Comp", "Pred Actual Start", "Pred Actual Finish", "OOS Reason")
     
-    ' Transpose array in pure VBA
+    ' Wait: we have 16 columns now for complete date visibility!
     Dim FinalArr() As Variant
-    ReDim FinalArr(1 To OutCount, 1 To 13)
+    ReDim FinalArr(1 To OutCount, 1 To 16)
     Dim r As Long, c As Long
     For r = 1 To OutCount
-        For c = 1 To 13
+        For c = 1 To 16
             FinalArr(r, c) = OutArr(c, r)
         Next c
     Next r
-    Erase OutArr ' Free RAM immediately
+    Erase OutArr
     
     With xlSheet
-        .Range("A1:M1").Value = headers
-        .Range("A1:M1").Font.Bold = True
-        .Range("A1:M1").Interior.Color = RGB(217, 225, 242)
+        .Range("A1:P1").Value = headers
+        .Range("A1:P1").Font.Bold = True
+        .Range("A1:P1").Interior.Color = RGB(217, 225, 242)
         
-        ' Instant bulk write to Excel
-        .Range("A2").Resize(OutCount, 13).Value = FinalArr
+        .Range("A2").Resize(OutCount, 16).Value = FinalArr
         
-        ' Format columns
         .Columns("E:E").NumberFormat = "0%"
-        .Columns("L:L").NumberFormat = "0%"
-        .Columns("A:M").AutoFit
-        .Range("A1:M1").AutoFilter
+        .Columns("M:M").NumberFormat = "0%"
+        .Columns("A:P").AutoFit
+        .Range("A1:P1").AutoFilter
         .Application.ActiveWindow.SplitRow = 1
         .Application.ActiveWindow.FreezePanes = True
     End With
@@ -101,139 +137,116 @@ Sub ExportMasterOOSToExcel_30k_Fixed()
     xlApp.Visible = True
     
     MsgBox "Scanned " & Format(TasksScanned, "#,##0") & " tasks in " & Format(Timer - startTime, "0.0") & " seconds!" & vbCrLf & _
-           "Exported " & Format(OutCount, "#,##0") & " out-of-sequence links to Excel.", vbInformation
+           "Exported " & Format(OutCount, "#,##0") & " true Out-of-Sequence links to Excel.", vbInformation
            
-    Set xlSheet = Nothing
-    Set xlBook = Nothing
-    Set xlApp = Nothing
-    Set ScannedProjects = Nothing
+    Set GhostLookup = Nothing
 End Sub
 
-Private Sub ProcessProject(ByVal prj As Project)
-    Dim t As Task
-    Dim subPrj As Subproject
-    Dim prjName As String
-    
-    If prj Is Nothing Then Exit Sub
-    If ScannedProjects.Exists(prj.FullName) Then Exit Sub
-    ScannedProjects.Add prj.FullName, True
-    
-    prjName = prj.Name
-    
-    For Each t In prj.Tasks
-        If Not t Is Nothing Then
-            ' Ignore Summary tasks, External ghost tasks, and Inactive tasks
-            If Not t.Summary And Not t.ExternalTask Then
-                If t.Active Then
-                    TasksScanned = TasksScanned + 1
-                    
-                    ' Keep Windows responsive and update Status Bar every 500 tasks
-                    If TasksScanned Mod 500 = 0 Then
-                        Application.StatusBar = "Scanning [" & prjName & "]... Tasks checked: " & _
-                                                Format(TasksScanned, "#,##0") & " | OOS Found: " & OutCount
-                        DoEvents
-                    End If
-                    
-                    ' SPEED GATE: Only inspect tasks that have started AND have predecessors
-                    If t.ActualStart <> "NA" Then
-                        If Len(t.Predecessors) > 0 Then
-                            CheckTaskOOS t
-                        End If
-                    End If
-                End If
-            End If
-        End If
-    Next t
-    
-    ' Recursively process all inserted subprojects
-    For Each subPrj In prj.Subprojects
-        On Error Resume Next
-        If Not subPrj.SourceProject Is Nothing Then
-            ProcessProject subPrj.SourceProject
-        End If
-        On Error GoTo 0
-    Next subPrj
-End Sub
-
-Private Sub CheckTaskOOS(ByVal t As Task)
+Private Sub CheckTaskOOS_Live(ByVal t As Task)
     Dim dep As TaskDependency
+    Dim rawP As Task
     Dim p As Task
     Dim isOOS As Boolean
     Dim relType As String
     Dim oosReason As String
-    Dim pPct As Double
-    Dim predPrjName As String
-    Dim predID As Variant
-    Dim predUID As Variant
+    
+    If OutCount = 0 Then ReDim OutArr(1 To 16, 1 To 5000)
     
     For Each dep In t.TaskDependencies
-        ' Use exact object reference matching (dep.To.UniqueID = t.UniqueID AND same parent project)
-        If dep.To.UniqueID = t.UniqueID And Not dep.To.ExternalTask Then
-            Set p = dep.From
+        ' Ensure we are only looking at Predecessors OF task 't' (where 't' is the Successor / dep.To)
+        ' Checking both UniqueID and Name + Project prevents any possibility of swapping Predecessor & Successor
+        If dep.To.UniqueID = t.UniqueID And dep.To.Name = t.Name Then
+            Set rawP = dep.From
             
-            If Not p Is Nothing Then
-                ' Check that predecessor is active
-                If p.Active Then
-                    isOOS = False
-                    pPct = p.PercentComplete
-                    
-                    Select Case dep.Type
-                        Case pjFinishToStart '0
-                            If pPct < 100 Then
-                                isOOS = True
+            If Not rawP Is Nothing Then
+                ' If rawP is an External Ghost Task, resolve it to the REAL task so we don't read a stale 0% Complete!
+                If rawP.ExternalTask Then
+                    Set p = ResolveGhostTask(rawP)
+                Else
+                    Set p = rawP
+                End If
+                
+                If Not p Is Nothing Then
+                    If p.Active And Not p.Summary Then
+                        isOOS = False
+                        oosReason = ""
+                        
+                        Select Case dep.Type
+                            Case pjFinishToStart '0 (FS)
                                 relType = "FS"
-                                oosReason = "Started before Predecessor finished"
-                            End If
-                        Case pjStartToStart '1
-                            If p.ActualStart = "NA" Then
-                                isOOS = True
+                                If p.ActualFinish = "NA" And p.PercentComplete < 100 Then
+                                    isOOS = True
+                                    oosReason = "Live OOS: Successor started, but Predecessor is not finished (" & p.PercentComplete & "%)"
+                                ElseIf IsDate(p.ActualFinish) And IsDate(t.ActualStart) Then
+                                    ' Check if Successor actually started on a day BEFORE Predecessor finished
+                                    If DateValue(t.ActualStart) < DateValue(p.ActualFinish) Then
+                                        isOOS = True
+                                        oosReason = "Historical OOS: Successor started (" & Format(t.ActualStart, "mm/dd/yy") & _
+                                                    ") before Predecessor finished (" & Format(p.ActualFinish, "mm/dd/yy") & ")"
+                                    End If
+                                End If
+                                
+                            Case pjStartToStart '1 (SS)
                                 relType = "SS"
-                                oosReason = "Started before Predecessor started"
-                            End If
-                        Case pjFinishToFinish '2
-                            If t.PercentComplete = 100 And pPct < 100 Then
-                                isOOS = True
+                                If p.ActualStart = "NA" And p.PercentComplete = 0 Then
+                                    isOOS = True
+                                    oosReason = "Live OOS: Successor started, but Predecessor has not started (0%)"
+                                ElseIf IsDate(p.ActualStart) And IsDate(t.ActualStart) Then
+                                    If DateValue(t.ActualStart) < DateValue(p.ActualStart) Then
+                                        isOOS = True
+                                        oosReason = "Historical OOS: Successor started (" & Format(t.ActualStart, "mm/dd/yy") & _
+                                                    ") before Predecessor started (" & Format(p.ActualStart, "mm/dd/yy") & ")"
+                                    End If
+                                End If
+                                
+                            Case pjFinishToFinish '2 (FF)
                                 relType = "FF"
-                                oosReason = "Finished before Predecessor finished"
-                            End If
-                        Case pjStartToFinish '3
-                            If t.PercentComplete = 100 And p.ActualStart = "NA" Then
-                                isOOS = True
+                                If t.ActualFinish <> "NA" Or t.PercentComplete = 100 Then
+                                    If p.ActualFinish = "NA" And p.PercentComplete < 100 Then
+                                        isOOS = True
+                                        oosReason = "Live OOS: Successor finished, but Predecessor is not finished (" & p.PercentComplete & "%)"
+                                    ElseIf IsDate(p.ActualFinish) And IsDate(t.ActualFinish) Then
+                                        If DateValue(t.ActualFinish) < DateValue(p.ActualFinish) Then
+                                            isOOS = True
+                                            oosReason = "Historical OOS: Successor finished (" & Format(t.ActualFinish, "mm/dd/yy") & _
+                                                        ") before Predecessor finished (" & Format(p.ActualFinish, "mm/dd/yy") & ")"
+                                        End If
+                                    End If
+                                End If
+                                
+                            Case pjStartToFinish '3 (SF)
                                 relType = "SF"
-                                oosReason = "Finished before Predecessor started"
+                                If t.ActualFinish <> "NA" Or t.PercentComplete = 100 Then
+                                    If p.ActualStart = "NA" And p.PercentComplete = 0 Then
+                                        isOOS = True
+                                        oosReason = "Live OOS: Successor finished, but Predecessor has not started (0%)"
+                                    End If
+                                End If
+                        End Select
+                        
+                        If isOOS Then
+                            OutCount = OutCount + 1
+                            If OutCount > UBound(OutArr, 2) Then
+                                ReDim Preserve OutArr(1 To 16, 1 To UBound(OutArr, 2) + 5000)
                             End If
-                    End Select
-                    
-                    If isOOS Then
-                        OutCount = OutCount + 1
-                        If OutCount > UBound(OutArr, 2) Then
-                            ReDim Preserve OutArr(1 To 13, 1 To UBound(OutArr, 2) + 5000)
+                            
+                            OutArr(1, OutCount) = t.Project
+                            OutArr(2, OutCount) = t.ID
+                            OutArr(3, OutCount) = t.UniqueID
+                            OutArr(4, OutCount) = t.Name
+                            OutArr(5, OutCount) = t.PercentComplete / 100
+                            OutArr(6, OutCount) = FormatDateSafe(t.ActualStart)
+                            OutArr(7, OutCount) = FormatDateSafe(t.ActualFinish)
+                            OutArr(8, OutCount) = p.Project
+                            OutArr(9, OutCount) = p.ID
+                            OutArr(10, OutCount) = p.UniqueID
+                            OutArr(11, OutCount) = p.Name
+                            OutArr(12, OutCount) = relType
+                            OutArr(13, OutCount) = p.PercentComplete / 100
+                            OutArr(14, OutCount) = FormatDateSafe(p.ActualStart)
+                            OutArr(15, OutCount) = FormatDateSafe(p.ActualFinish)
+                            OutArr(16, OutCount) = oosReason
                         End If
-                        
-                        ' Determine if the Predecessor is in the same subproject or an External Cross-Project Link
-                        If p.ExternalTask Then
-                            predPrjName = ExtractExternalProjectName(p.Project)
-                            predID = p.ID & " (Ext)"
-                            predUID = ExtractExternalUID(p)
-                        Else
-                            predPrjName = p.Project
-                            predID = p.ID
-                            predUID = p.UniqueID
-                        End If
-                        
-                        OutArr(1, OutCount) = t.Project
-                        OutArr(2, OutCount) = t.ID
-                        OutArr(3, OutCount) = t.UniqueID
-                        OutArr(4, OutCount) = t.Name
-                        OutArr(5, OutCount) = t.PercentComplete / 100
-                        OutArr(6, OutCount) = Format(t.ActualStart, "yyyy-mm-dd")
-                        OutArr(7, OutCount) = predPrjName
-                        OutArr(8, OutCount) = predID
-                        OutArr(9, OutCount) = predUID
-                        OutArr(10, OutCount) = p.Name
-                        OutArr(11, OutCount) = relType
-                        OutArr(12, OutCount) = pPct / 100
-                        OutArr(13, OutCount) = oosReason
                     End If
                 End If
             End If
@@ -241,21 +254,57 @@ Private Sub CheckTaskOOS(ByVal t As Task)
     Next dep
 End Sub
 
-' Extracts the clean file name or path of an external predecessor
-Private Function ExtractExternalProjectName(ByVal rawPrj As String) As String
-    Dim slashPos As Long
-    slashPos = InStrRev(rawPrj, "\")
-    If slashPos > 0 Then
-        ExtractExternalProjectName = Mid(rawPrj, slashPos + 1)
+' Resolves a Ghost Task (which often holds stale 0% complete data) to the real, live Task object!
+Private Function ResolveGhostTask(ByVal ghost As Task) As Task
+    On Error Resume Next
+    ' In MS Project, a Ghost Task's .Project property contains the full path + UniqueID of the source task:
+    ' Example: "C:\Folder\SubprojectA.mpp\104"
+    Dim rawPath As String
+    Dim lastSlash As Long
+    Dim filePart As String
+    Dim uidPart As String
+    Dim shortFile As String
+    
+    rawPath = ghost.Project
+    lastSlash = InStrRev(rawPath, "\")
+    
+    If lastSlash > 0 Then
+        uidPart = Mid(rawPath, lastSlash + 1)
+        filePart = Left(rawPath, lastSlash - 1)
+        
+        If IsNumeric(uidPart) Then
+            If GhostLookup.Exists(filePart & "|" & uidPart) Then
+                Set ResolveGhostTask = GhostLookup(filePart & "|" & uidPart)
+                Exit Function
+            End If
+            
+            shortFile = StripExtension(Mid(filePart, InStrRev(filePart, "\") + 1))
+            If GhostLookup.Exists(shortFile & "|" & uidPart) Then
+                Set ResolveGhostTask = GhostLookup(shortFile & "|" & uidPart)
+                Exit Function
+            End If
+        End If
+    End If
+    
+    ' Fallback to the ghost task itself if external file is not loaded in the master
+    Set ResolveGhostTask = ghost
+    On Error GoTo 0
+End Function
+
+Private Function FormatDateSafe(ByVal d As Variant) As String
+    If IsDate(d) Then
+        FormatDateSafe = Format(d, "yyyy-mm-dd")
     Else
-        ExtractExternalProjectName = rawPrj
+        FormatDateSafe = "NA"
     End If
 End Function
 
-' Extracts the true Unique ID or Task ID from the External Task path string (FullPath\File.mpp\UniqueID)
-Private Function ExtractExternalUID(ByVal extTask As Task) As String
-    On Error Resume Next
-    ' In MS Project, an external task's true link string is stored in Predecessors or can be read from the ghost task
-    ExtractExternalUID = "Ext Ghost UID: " & extTask.UniqueID
-    On Error GoTo 0
+Private Function StripExtension(ByVal fileName As String) As String
+    Dim dotPos As Long
+    dotPos = InStrRev(fileName, ".")
+    If dotPos > 0 Then
+        StripExtension = Left(fileName, dotPos - 1)
+    Else
+        StripExtension = fileName
+    End If
 End Function
