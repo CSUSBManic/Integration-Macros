@@ -1,0 +1,205 @@
+Option Explicit
+
+' Global variables to hold data in memory for instant Excel export
+Dim OutArr() As Variant
+Dim OutCount As Long
+
+Sub ExportMasterOOSToExcel()
+    Dim xlApp As Object
+    Dim xlBook As Object
+    Dim xlSheet As Object
+    Dim startTime As Double
+    
+    startTime = Timer
+    OutCount = 0
+    ReDim OutArr(1 To 12, 1 To 1000) ' Pre-allocate memory (auto-expands if >1000)
+    
+    ' Turn off screen updating and manual calculation for maximum speed
+    Application.ScreenUpdating = False
+    Application.Calculation = pjManual
+    
+    ' 1. Scan the Master Project AND recursively scan all inserted Subprojects
+    ProcessProject ActiveProject
+    
+    ' Restore MS Project settings
+    Application.Calculation = pjAutomatic
+    Application.ScreenUpdating = True
+    
+    ' 2. Check if any OOS tasks were found
+    If OutCount = 0 Then
+        MsgBox "Great news! No Out-of-Sequence tasks were found across the Master Project (" & _
+               Format(Timer - startTime, "0.0") & " seconds).", vbInformation
+        Exit Sub
+    End If
+    
+    ' 3. Initialize Excel
+    On Error Resume Next
+    Set xlApp = CreateObject("Excel.Application")
+    If Err.Number <> 0 Then
+        MsgBox "Could not start Excel. Please make sure Excel is installed.", vbCritical
+        Exit Sub
+    End If
+    On Error GoTo 0
+    
+    Set xlBook = xlApp.Workbooks.Add
+    Set xlSheet = xlBook.Sheets(1)
+    xlSheet.Name = "Master OOS Report"
+    
+    ' 4. Create Headers (Including Project Columns for both Task & Predecessor)
+    Dim headers As Variant
+    headers = Array("Project", "Task ID", "Unique ID", "Task Name", "Task % Comp", "Actual Start", _
+                    "Pred Project", "Pred ID", "Pred UID", "Predecessor Name", "Link Type", "Pred % Comp / Reason")
+    
+    With xlSheet
+        .Range("A1:L1").Value = headers
+        .Range("A1:L1").Font.Bold = True
+        .Range("A1:L1").Interior.Color = RGB(217, 225, 242)
+        
+        ' 5. Dump the entire memory array into Excel in one instant operation
+        ReDim Preserve OutArr(1 To 12, 1 To OutCount)
+        .Range("A2").Resize(OutCount, 12).Value = xlApp.WorksheetFunction.Transpose(OutArr)
+        
+        ' Format columns and add AutoFilters
+        .Columns("E:E").NumberFormat = "0%"
+        .Columns("A:L").AutoFit
+        .Range("A1:L1").AutoFilter
+        .Application.ActiveWindow.SplitRow = 1
+        .Application.ActiveWindow.FreezePanes = True
+    End With
+    
+    xlApp.Visible = True
+    MsgBox "Export complete in " & Format(Timer - startTime, "0.0") & " seconds!" & vbCrLf & _
+           "Found " & OutCount & " out-of-sequence relationships.", vbInformation
+           
+    Set xlSheet = Nothing
+    Set xlBook = Nothing
+    Set xlApp = Nothing
+End Sub
+
+Private Sub ProcessProject(ByVal prj As Project)
+    Dim t As Task
+    Dim subPrj As Subproject
+    
+    ' Scan all tasks in the current project/subproject
+    For Each t In prj.Tasks
+        If Not t Is Nothing Then
+            ' Ignore Summary tasks, blank rows, and Ghost/External placeholder tasks
+            If Not t.Summary And Not t.ExternalTask Then
+                CheckTaskOOS t
+            End If
+        End If
+    Next t
+    
+    ' Recursively drill down into all inserted subprojects
+    For Each subPrj In prj.Subprojects
+        On Error Resume Next
+        If Not subPrj.SourceProject Is Nothing Then
+            ProcessProject subPrj.SourceProject
+        End If
+        On Error GoTo 0
+    Next subPrj
+End Sub
+
+Private Sub CheckTaskOOS(ByVal t As Task)
+    Dim dep As TaskDependency
+    Dim p As Task
+    Dim realP As Task
+    Dim isOOS As Boolean
+    Dim relType As String
+    Dim oosReason As String
+    
+    ' Only check tasks that have actually started
+    If t.ActualStart <> "NA" Then
+        For Each dep In t.TaskDependencies
+            ' Match using BOTH UniqueID and Project Name to prevent Subproject ID collisions
+            If dep.To.UniqueID = t.UniqueID And dep.To.Project = t.Project Then
+                Set p = dep.From
+                
+                ' Resolve Cross-Project "Ghost" Predecessors to the actual task in the other subproject
+                If p.ExternalTask Then
+                    Set realP = ResolveExternalTask(p)
+                Else
+                    Set realP = p
+                End If
+                
+                If Not realP Is Nothing Then
+                    isOOS = False
+                    oosReason = ""
+                    
+                    Select Case dep.Type
+                        Case pjFinishToStart '0
+                            relType = "FS"
+                            If realP.PercentComplete < 100 Then
+                                isOOS = True
+                                oosReason = realP.PercentComplete & "% - Started before Pred finished"
+                            End If
+                        Case pjStartToStart '1
+                            relType = "SS"
+                            If realP.ActualStart = "NA" Then
+                                isOOS = True
+                                oosReason = realP.PercentComplete & "% - Started before Pred started"
+                            End If
+                        Case pjFinishToFinish '2
+                            relType = "FF"
+                            If t.PercentComplete = 100 And realP.PercentComplete < 100 Then
+                                isOOS = True
+                                oosReason = realP.PercentComplete & "% - Finished before Pred finished"
+                            End If
+                        Case pjStartToFinish '3
+                            relType = "SF"
+                            If t.PercentComplete = 100 And realP.ActualStart = "NA" Then
+                                isOOS = True
+                                oosReason = realP.PercentComplete & "% - Finished before Pred started"
+                            End If
+                    End Select
+                    
+                    ' Store OOS violation in memory array
+                    If isOOS Then
+                        OutCount = OutCount + 1
+                        If OutCount > UBound(OutArr, 2) Then
+                            ReDim Preserve OutArr(1 To 12, 1 To UBound(OutArr, 2) + 1000)
+                        End If
+                        
+                        OutArr(1, OutCount) = t.Project
+                        OutArr(2, OutCount) = t.ID
+                        OutArr(3, OutCount) = t.UniqueID
+                        OutArr(4, OutCount) = t.Name
+                        OutArr(5, OutCount) = t.PercentComplete / 100
+                        OutArr(6, OutCount) = Format(t.ActualStart, "yyyy-mm-dd")
+                        OutArr(7, OutCount) = realP.Project
+                        OutArr(8, OutCount) = realP.ID
+                        OutArr(9, OutCount) = realP.UniqueID
+                        OutArr(10, OutCount) = realP.Name
+                        OutArr(11, OutCount) = relType
+                        OutArr(12, OutCount) = oosReason
+                    End If
+                End If
+            End If
+        Next dep
+    End If
+End Sub
+
+' Helper function to trace a Cross-Project Ghost Task back to its real source task
+Private Function ResolveExternalTask(ByVal extTask As Task) As Task
+    Dim appPrj As Project
+    On Error Resume Next
+    
+    ' If it's a normal task, return it immediately
+    If Not extTask.ExternalTask Then
+        Set ResolveExternalTask = extTask
+        Exit Function
+    End If
+    
+    ' Search open projects/subprojects for the real source task using its UniqueID
+    For Each appPrj In Application.Projects
+        If InStr(1, extTask.Project, appPrj.Name, vbTextCompare) > 0 Or _
+           InStr(1, appPrj.FullName, extTask.Project, vbTextCompare) > 0 Then
+            Set ResolveExternalTask = appPrj.Tasks.UniqueID(extTask.UniqueID)
+            If Not ResolveExternalTask Is Nothing Then Exit Function
+        End If
+    Next appPrj
+    
+    ' Fallback to the external task object itself if the external file isn't loaded
+    Set ResolveExternalTask = extTask
+    On Error GoTo 0
+End Function
