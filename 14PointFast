@@ -16,7 +16,8 @@ Private Const QC As Long = 12   'columns on reconciliation sheet
 
 'run state
 Private sdDay As Long, loeFld As Long, maxBF As Date, curFile As String
-Private nSdDiff As Long
+Private nSdDiff As Long, nPuidErr As Long
+Private curT As Task            'task being read (for error reporting)
 Private dFiles As Object        'file path / name -> Project object
 
 'counters
@@ -130,7 +131,8 @@ Public Sub DCMA14_Check()
     ws.Name = "Summary"
 
     If unread.Count > 0 Then warn = unread.Count & " subproject(s) could NOT be read - see 00 Reconciliation.  "
-    If nSdDiff > 0 Then warn = warn & nSdDiff & " file(s) have a status date different from the one used - see 00 Reconciliation."
+    If nSdDiff > 0 Then warn = warn & nSdDiff & " file(s) have a status date different from the one used - see 00 Reconciliation.  "
+    If nPuidErr > 0 Then warn = warn & nPuidErr & " PUID (Text15) value(s) could not be read and are shown as #ERROR on the detail sheets."
     If Len(warn) = 0 Then warn = "None"
 
     Dim hdr(1 To 6, 1 To 2) As Variant
@@ -230,11 +232,13 @@ Public Sub DCMA14_Check()
     xl.Visible = True
     Application.ScreenUpdating = True
     Set dFiles = Nothing
+    Set curT = Nothing
     Exit Sub
 
 Fail:
     errMsg = "DCMA check stopped: " & Err.Description
     If Len(curFile) > 0 Then errMsg = errMsg & vbCrLf & "While reading: " & curFile
+    errMsg = errMsg & TaskLabel(curT)
     On Error Resume Next
     Application.ScreenUpdating = True
     If Not xl Is Nothing Then
@@ -299,6 +303,7 @@ Private Sub ScanProject(p As Project, ByVal isMaster As Boolean, ByVal hasSubs A
     hiDur = HIGH_DUR_DAYS * mpd
 
     For Each t In p.Tasks
+        Set curT = t
         If t Is Nothing Then
             qRows = qRows + 1: qBlank = qBlank + 1
             GoTo NextTask
@@ -337,7 +342,7 @@ Private Sub ScanProject(p As Project, ByVal isMaster As Boolean, ByVal hasSubs A
             End If
         End If
         If loeFld <> 0 Then
-            If StrComp(t.GetField(loeFld), LOE_VALUE, vbTextCompare) = 0 Then
+            If StrComp(LoeText(t), LOE_VALUE, vbTextCompare) = 0 Then
                 qLoe = qLoe + 1: GoTo NextTask
             End If
         End If
@@ -487,6 +492,7 @@ Private Sub ScanProject(p As Project, ByVal isMaster As Boolean, ByVal hasSubs A
         If bad Then nInvalid = nInvalid + 1
 NextTask:
     Next t
+    Set curT = Nothing
 
     'reconciliation row for this file
     If isMaster And hasSubs Then
@@ -510,11 +516,12 @@ End Sub
 '------------------------- helpers -------------------------
 
 Private Sub ResetState()
-    sdDay = 0: loeFld = 0: maxBF = 0: curFile = "": nSdDiff = 0
+    sdDay = 0: loeFld = 0: maxBF = 0: curFile = "": nSdDiff = 0: nPuidErr = 0
     nTotal = 0: nInc = 0: nIncDur = 0: nRel = 0: nFS = 0
     nLogic = 0: nLead = 0: nLag = 0: nHard = 0
     nHiFloat = 0: nNegFloat = 0: nHiDur = 0
     nInvalid = 0: nNoRes = 0: nMissed = 0: nBLDue = 0: nDone = 0
+    Set curT = Nothing
     Set cLogic = New Collection: Set cLead = New Collection: Set cLag = New Collection
     Set cNonFS = New Collection: Set cHard = New Collection: Set cHiFloat = New Collection
     Set cNegFloat = New Collection: Set cHiDur = New Collection: Set cInvalid = New Collection
@@ -522,6 +529,43 @@ Private Sub ResetState()
     Set dFiles = CreateObject("Scripting.Dictionary")
     dFiles.CompareMode = vbTextCompare
 End Sub
+
+'Reads the PUID (Text15). Project raises an error when the field's formula
+'evaluates to #ERROR; in that case "#ERROR" is returned and the run continues.
+Private Function PUID(t As Task) As String
+    Dim s As String
+    On Error Resume Next
+    s = t.Text15
+    If Err.Number <> 0 Then
+        Err.Clear
+        s = "#ERROR"
+        nPuidErr = nPuidErr + 1
+    End If
+    On Error GoTo 0
+    PUID = s
+End Function
+
+'Reads the LOE field; a field that cannot be read is treated as "not LOE"
+Private Function LoeText(t As Task) As String
+    Dim s As String
+    On Error Resume Next
+    s = t.GetField(loeFld)
+    If Err.Number <> 0 Then
+        Err.Clear
+        s = ""
+    End If
+    On Error GoTo 0
+    LoeText = s
+End Function
+
+'Describes the task being read when the run stops (used by the error message)
+Private Function TaskLabel(t As Task) As String
+    Dim s As String
+    On Error Resume Next
+    If t Is Nothing Then Exit Function
+    s = vbCrLf & "Task ID " & t.ID & ", Unique ID " & t.UniqueID & ": " & t.Name
+    TaskLabel = s
+End Function
 
 'Adds a task row to a collector; task fields are read only once per flagged task
 Private Sub AddTask(c As Collection, t As Task, row As Variant, built As Boolean, _
@@ -536,7 +580,7 @@ End Sub
 
 Private Function TaskRow(t As Task, ByVal mpd As Double) As Variant
     Dim r(1 To TC) As Variant
-    r(1) = t.Text15                       'PUID
+    r(1) = PUID(t)                        'PUID (Text15)
     r(2) = t.Project
     r(3) = t.UniqueID
     r(4) = t.ID
@@ -560,7 +604,7 @@ Private Function RelRow(t As Task, dep As TaskDependency, ByVal mpd As Double, _
                         ByVal finding As String) As Variant
     Dim r(1 To RC) As Variant, p As Task, q As Task, lg As Double
     Set p = dep.From
-    r(1) = t.Text15                       'successor PUID
+    r(1) = PUID(t)                        'successor PUID
     r(2) = t.Project
     r(3) = t.UniqueID
     r(4) = t.Name
@@ -572,7 +616,7 @@ Private Function RelRow(t As Task, dep As TaskDependency, ByVal mpd As Double, _
             Set p = q
         End If
     End If
-    r(5) = p.Text15                       'predecessor PUID
+    r(5) = PUID(p)                        'predecessor PUID
     If IsEmpty(r(6)) Then r(6) = p.Project
     r(7) = p.UniqueID
     r(8) = p.Name
