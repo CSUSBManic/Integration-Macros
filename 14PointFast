@@ -587,9 +587,9 @@ Private Function RelRow(t As Task, dep As TaskDependency, ByVal mpd As Double, _
         r(10) = 0
     Else
         Select Case dep.LagType
-            Case pjPercent, pjElapsedPercent
+            Case 19, 20, 51, 52                          'percent lags (Project has no named constant)
                 r(10) = lg: r(11) = "% (raw value)"
-            Case pjElapsedMinutes, pjElapsedHours, pjElapsedDays, pjElapsedWeeks, pjElapsedMonths
+            Case 4, 6, 8, 10, 12, 36, 38, 40, 42, 44     'elapsed min/hr/day/wk/mon, incl. estimated
                 r(10) = lg / 1440: r(11) = "elapsed days"
             Case Else
                 r(10) = lg / mpd: r(11) = "working days"
