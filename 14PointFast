@@ -7,55 +7,50 @@ Private Const EXCLUDE_MILESTONES As Boolean = True  'DCMA excludes zero-duration
 Private Const LOE_FIELD As String = ""              'e.g. "Flag5" or "Text10"; "" = no LOE exclusion
 Private Const LOE_VALUE As String = "Yes"           'value in LOE_FIELD that marks a task as LOE
 Private Const LIST_NON_FS As Boolean = True         'list every non-FS link on sheet 04
+Private Const STATUS_DATE_OVERRIDE As String = ""   'e.g. "2026-10-30"; "" = automatic
 '==================================================
 
 Private Const TC As Long = 18   'columns on task sheets
 Private Const RC As Long = 12   'columns on relationship sheets
+Private Const QC As Long = 12   'columns on reconciliation sheet
+
+'run state
+Private sdDay As Long, loeFld As Long, maxBF As Date, curFile As String
+Private nSdDiff As Long
+Private dFiles As Object        'file path / name -> Project object
+
+'counters
+Private nTotal As Long, nInc As Long, nIncDur As Long, nRel As Long, nFS As Long
+Private nLogic As Long, nLead As Long, nLag As Long, nHard As Long
+Private nHiFloat As Long, nNegFloat As Long, nHiDur As Long
+Private nInvalid As Long, nNoRes As Long
+Private nMissed As Long, nBLDue As Long, nDone As Long
+
+'detail collectors
+Private cLogic As Collection, cLead As Collection, cLag As Collection
+Private cNonFS As Collection, cHard As Collection, cHiFloat As Collection
+Private cNegFloat As Collection, cHiDur As Collection, cInvalid As Collection
+Private cNoRes As Collection, cMissed As Collection
 
 Public Sub DCMA14_Check()
 
-    Dim prj As Project, t As Task, dep As TaskDependency, o As Task
-    Dim sd As Date, mpd As Double, hiFloat As Double, hiDur As Double
-    Dim loeFld As Long, tStart As Single, errMsg As String
-
-    'counters
-    Dim nTotal As Long, nInc As Long, nIncDur As Long, nRel As Long, nFS As Long
-    Dim nLogic As Long, nLead As Long, nLag As Long, nHard As Long
-    Dim nHiFloat As Long, nNegFloat As Long, nHiDur As Long
-    Dim nInvalid As Long, nNoRes As Long
-    Dim nMissed As Long, nBLDue As Long, nDone As Long
-
-    'detail collectors (filled in memory, written to Excel in one shot each)
-    Dim cLogic As New Collection, cLead As New Collection, cLag As New Collection
-    Dim cNonFS As New Collection, cHard As New Collection, cHiFloat As New Collection
-    Dim cNegFloat As New Collection, cHiDur As New Collection, cInvalid As New Collection
-    Dim cNoRes As New Collection, cMissed As New Collection
-
-    'per-task working variables
-    Dim row As Variant, built As Boolean, bad As Boolean
-    Dim vAS As Variant, vAF As Variant, vBF As Variant, vD As Variant
-    Dim hasAF As Boolean, hasBF As Boolean
-    Dim dur As Double, ts As Double, bd As Double, lg As Double
-    Dim uid As Long, sProj As String, nP As Long, nS As Long, isPred As Boolean
-    Dim maxBF As Date, curProj As String, curCnt As Long, dProj As Object
-
-    'output
-    Dim xl As Object, wb As Object, ws As Object
-    Dim hT As Variant, hR As Variant, sp() As Variant, k As Variant, i As Long
+    Dim prj As Project, p As Project
+    Dim files As New Collection, unread As New Collection
+    Dim sd As Date, sdSource As String, v As Variant, k As Variant
+    Dim recon() As Variant, tot() As Variant
+    Dim i As Long, j As Long, tStart As Single, errMsg As String, warn As String
+    Dim xl As Object, wb As Object, ws As Object, wsR As Object
+    Dim hT As Variant, hR As Variant, hQ As Variant
 
     On Error GoTo Fail
     tStart = Timer
     Set prj = ActiveProject
-    mpd = prj.HoursPerDay * 60
-    hiFloat = HIGH_FLOAT_DAYS * mpd
-    hiDur = HIGH_DUR_DAYS * mpd
-    If IsDate(prj.StatusDate) Then sd = CDate(prj.StatusDate) Else sd = CDate(prj.CurrentDate)
+    ResetState
     If Len(LOE_FIELD) > 0 Then loeFld = FieldNameToFieldConstant(LOE_FIELD, pjTask)
-    Set dProj = CreateObject("Scripting.Dictionary")
 
     Application.ScreenUpdating = False
 
-    'Make sure every subproject is loaded into the master's Tasks collection
+    'Expand the master so every subproject is loaded
     If prj.Subprojects.Count > 0 Then
         On Error Resume Next
         SelectAll
@@ -63,49 +58,313 @@ Public Sub DCMA14_Check()
         On Error GoTo Fail
     End If
 
-    '========================= SINGLE PASS =========================
-    For Each t In prj.Tasks
-        If t Is Nothing Then GoTo NextTask
-        If t.Summary Then GoTo NextTask
-        If t.ExternalTask Then GoTo NextTask
-        If Not t.Active Then GoTo NextTask
+    'Build the list of files: master first, then every subproject (nested ones included)
+    files.Add prj
+    RegisterFile prj
+    CollectSubprojects prj, files, unread
+
+    '---------------- status date ----------------
+    If Len(STATUS_DATE_OVERRIDE) > 0 Then
+        sd = CDate(STATUS_DATE_OVERRIDE)
+        sdSource = "STATUS_DATE_OVERRIDE setting"
+    ElseIf IsDate(prj.StatusDate) Then
+        sd = CDate(prj.StatusDate)
+        sdSource = "master project"
+    Else
+        For Each p In files
+            If IsDate(p.StatusDate) Then
+                If CDate(p.StatusDate) > sd Then sd = CDate(p.StatusDate)
+            End If
+        Next p
+        If sd > 0 Then
+            sdSource = "latest subproject status date - master has none"
+        Else
+            Application.ScreenUpdating = True
+            v = InputBox("No status date is set in the master or in any subproject." & vbCrLf & _
+                         "Enter the status date to assess against:", "DCMA 14-Point", Format(Date, "yyyy-mm-dd"))
+            If Not IsDate(v) Then
+                MsgBox "No valid status date - check cancelled.", vbExclamation
+                Exit Sub
+            End If
+            sd = CDate(v)
+            sdSource = "entered at run time"
+            Application.ScreenUpdating = False
+        End If
+    End If
+    sdDay = DayOf(sd)
+
+    '---------------- scan every file once ----------------
+    ReDim recon(1 To files.Count, 1 To QC)
+    i = 0
+    For Each p In files
+        i = i + 1
+        ScanProject p, (i = 1), (prj.Subprojects.Count > 0), recon, i
+    Next p
+
+    '--- 13 CPLI = (critical path length + total float) / critical path length
+    Dim vPF As Variant, vPBF As Variant, cpl As Double, tf As Double, mpd As Double
+    Dim cpli As Variant, cpliStat As String, cpliNote As String
+    mpd = prj.HoursPerDay * 60
+    If mpd <= 0 Then mpd = 480
+    cpli = "N/A": cpliStat = "N/A"
+    vPF = prj.ProjectSummaryTask.Finish
+    vPBF = prj.ProjectSummaryTask.BaselineFinish
+    If Not IsDate(vPBF) Then If maxBF > 0 Then vPBF = maxBF   'master not baselined: use latest task baseline
+    If IsDate(vPF) And IsDate(vPBF) Then
+        cpl = WorkDays(sd, CDate(vPF), mpd)
+        tf = WorkDays(CDate(vPF), CDate(vPBF), mpd)
+        If cpl > 0 Then
+            cpli = (cpl + tf) / cpl
+            If cpli >= 0.95 Then cpliStat = "PASS" Else cpliStat = "FAIL"
+        End If
+        cpliNote = "CPL = " & Format(cpl, "0.0") & " wd (status date to forecast finish); float vs baseline finish = " & Format(tf, "0.0") & " wd"
+    Else
+        cpliNote = "No baseline finish found - cannot calculate"
+    End If
+
+    '========================= EXCEL OUTPUT =========================
+    Set xl = CreateObject("Excel.Application")
+    xl.ScreenUpdating = False
+    Set wb = xl.Workbooks.Add(-4167)          'xlWBATWorksheet: one sheet
+    Set ws = wb.Worksheets(1)
+    ws.Name = "Summary"
+
+    If unread.Count > 0 Then warn = unread.Count & " subproject(s) could NOT be read - see 00 Reconciliation.  "
+    If nSdDiff > 0 Then warn = warn & nSdDiff & " file(s) have a status date different from the one used - see 00 Reconciliation."
+    If Len(warn) = 0 Then warn = "None"
+
+    Dim hdr(1 To 6, 1 To 2) As Variant
+    hdr(1, 1) = "DCMA 14-Point Assessment"
+    hdr(2, 1) = "Project":     hdr(2, 2) = prj.Name
+    hdr(3, 1) = "Status date": hdr(3, 2) = Format(sd, "dd-mmm-yyyy") & "  (source: " & sdSource & ")"
+    hdr(4, 1) = "Population":  hdr(4, 2) = nTotal & " tasks assessed across " & files.Count & " files; " & nInc & " incomplete; " & nRel & " predecessor links on incomplete tasks"
+    hdr(5, 1) = "Run"
+    hdr(6, 1) = "Warnings":    hdr(6, 2) = warn
+    ws.Range("A1").Resize(6, 2).Value = hdr
+    ws.Range("A1").Font.Bold = True
+
+    Dim s(1 To 14, 1 To 8) As Variant
+    PutRow s, 1, "Logic", nLogic, nInc, Ratio(nLogic, nInc), "<= 5%", PF(nLogic, nInc, 0.05, True), "Incomplete tasks missing a predecessor and/or successor"
+    PutRow s, 2, "Leads", nLead, nRel, Ratio(nLead, nRel), "0%", PF(nLead, nRel, 0, True), "Predecessor links with negative lag"
+    PutRow s, 3, "Lags", nLag, nRel, Ratio(nLag, nRel), "<= 5%", PF(nLag, nRel, 0.05, True), "Predecessor links with positive lag"
+    PutRow s, 4, "Relationship Types", nFS, nRel, Ratio(nFS, nRel), ">= 90%", PF(nFS, nRel, 0.9, False), "Finish-to-Start links as a share of all links"
+    PutRow s, 5, "Hard Constraints", nHard, nInc, Ratio(nHard, nInc), "<= 5%", PF(nHard, nInc, 0.05, True), "MSO, MFO, SNLT, FNLT on incomplete tasks"
+    PutRow s, 6, "High Float", nHiFloat, nInc, Ratio(nHiFloat, nInc), "<= 5%", PF(nHiFloat, nInc, 0.05, True), "Total slack > " & HIGH_FLOAT_DAYS & " working days"
+    PutRow s, 7, "Negative Float", nNegFloat, nInc, Ratio(nNegFloat, nInc), "0%", PF(nNegFloat, nInc, 0, True), "Total slack < 0"
+    PutRow s, 8, "High Duration", nHiDur, nInc, Ratio(nHiDur, nInc), "<= 5%", PF(nHiDur, nInc, 0.05, True), "Baseline duration > " & HIGH_DUR_DAYS & " working days"
+    PutRow s, 9, "Invalid Dates", nInvalid, nTotal, Ratio(nInvalid, nTotal), "0%", PF(nInvalid, nTotal, 0, True), "Forecast dates before, or actual dates after, the status date (by calendar day)"
+    PutRow s, 10, "Resources", nNoRes, nIncDur, Ratio(nNoRes, nIncDur), "0%", PF(nNoRes, nIncDur, 0, True), "Incomplete tasks with duration and no resources"
+    PutRow s, 11, "Missed Tasks", nMissed, nBLDue, Ratio(nMissed, nBLDue), "<= 5%", PF(nMissed, nBLDue, 0.05, True), "Baseline finish <= status date, finished late or not finished"
+    PutRow s, 12, "Critical Path Test", "", "", "Manual", "Finish slips ~1:1", "MANUAL", "Add 600d to a critical task on a COPY and confirm the project finish moves by about the same amount"
+    PutRow s, 13, "Critical Path Length Index", "", "", cpli, ">= 0.95", cpliStat, cpliNote
+    PutRow s, 14, "Baseline Execution Index", nDone, nBLDue, Ratio(nDone, nBLDue), ">= 0.95", PF(nDone, nBLDue, 0.95, False), "Tasks finished / tasks baselined to finish by status date"
+
+    ws.Range("A8").Resize(1, 8).Value = Array("#", "Metric", "Count", "Population", "Result", "Threshold", "Status", "Basis")
+    ws.Range("A8").Resize(1, 8).Font.Bold = True
+    ws.Range("A9").Resize(14, 8).Value = s
+    ws.Range("E9:E19").NumberFormat = "0.00%"
+    ws.Range("E21:E22").NumberFormat = "0.00"
+    ws.Range("E9:G22").HorizontalAlignment = -4108      'xlCenter
+    For i = 1 To 14
+        Select Case s(i, 7)
+            Case "PASS": ws.Cells(8 + i, 7).Interior.Color = RGB(198, 239, 206)
+            Case "FAIL": ws.Cells(8 + i, 7).Interior.Color = RGB(255, 199, 206)
+            Case Else:   ws.Cells(8 + i, 7).Interior.Color = RGB(255, 235, 156)
+        End Select
+    Next i
+
+    'reconciliation sheet: where every row in every file went
+    Set wsR = wb.Worksheets.Add(, ws)
+    wsR.Name = "00 Reconciliation"
+    hQ = Array("File", "File Status Date", "Rows Read", "Blank Rows", "Summary Rows", "External (Ghost) Tasks", _
+               "Inactive", "Milestones (0 Duration)", "LOE", "Assessed (Total Tasks)", "Complete", "Incomplete")
+    wsR.Columns(1).NumberFormat = "@"
+    wsR.Range("A1").Resize(1, QC).Value = hQ
+    wsR.Range("A1").Resize(1, QC).Font.Bold = True
+    wsR.Range("A1").Resize(1, QC).Interior.Color = RGB(221, 235, 247)
+    wsR.Range("A2").Resize(files.Count, QC).Value = recon
+    ReDim tot(1 To 1, 1 To QC)
+    tot(1, 1) = "TOTAL"
+    For j = 3 To QC
+        For i = 1 To files.Count
+            tot(1, j) = tot(1, j) + recon(i, j)
+        Next i
+    Next j
+    wsR.Range("A" & files.Count + 2).Resize(1, QC).Value = tot
+    wsR.Range("A" & files.Count + 2).Resize(1, QC).Font.Bold = True
+    If unread.Count > 0 Then
+        i = files.Count + 4
+        wsR.Range("A" & i).Value = "Subprojects that could NOT be read:"
+        wsR.Range("A" & i).Font.Bold = True
+        For Each k In unread
+            i = i + 1
+            wsR.Range("A" & i).Value = k
+        Next k
+    End If
+    wsR.Columns.AutoFit
+
+    'detail sheets
+    hT = Array("PUID (Text15)", "Subproject", "Unique ID", "ID", "Task Name", "Finding", "% Complete", _
+               "Duration (d)", "Baseline Duration (d)", "Start", "Finish", "Baseline Start", "Baseline Finish", _
+               "Actual Start", "Actual Finish", "Total Slack (d)", "Constraint Type", "Constraint Date")
+    hR = Array("Successor PUID (Text15)", "Successor Subproject", "Successor Unique ID", "Successor Name", _
+               "Predecessor PUID (Text15)", "Predecessor Subproject", "Predecessor Unique ID", "Predecessor Name", _
+               "Link Type", "Lag", "Lag Basis", "Finding")
+
+    DumpSheet wb, "01 Logic", hT, cLogic, False
+    DumpSheet wb, "02 Leads", hR, cLead, True
+    DumpSheet wb, "03 Lags", hR, cLag, True
+    DumpSheet wb, "04 Non-FS Links", hR, cNonFS, True
+    DumpSheet wb, "05 Hard Constraints", hT, cHard, False
+    DumpSheet wb, "06 High Float", hT, cHiFloat, False
+    DumpSheet wb, "07 Negative Float", hT, cNegFloat, False
+    DumpSheet wb, "08 High Duration", hT, cHiDur, False
+    DumpSheet wb, "09 Invalid Dates", hT, cInvalid, False
+    DumpSheet wb, "10 Resources", hT, cNoRes, False
+    DumpSheet wb, "11 Missed Tasks", hT, cMissed, False
+
+    ws.Range("B5").Value = Format(Now, "dd-mmm-yyyy hh:nn") & "  (" & Format(Timer - tStart, "0.0") & " s)"
+    ws.Columns("A:H").AutoFit
+    ws.Activate
+    xl.ScreenUpdating = True
+    xl.Visible = True
+    Application.ScreenUpdating = True
+    Set dFiles = Nothing
+    Exit Sub
+
+Fail:
+    errMsg = "DCMA check stopped: " & Err.Description
+    If Len(curFile) > 0 Then errMsg = errMsg & vbCrLf & "While reading: " & curFile
+    On Error Resume Next
+    Application.ScreenUpdating = True
+    If Not xl Is Nothing Then
+        xl.ScreenUpdating = True
+        xl.Visible = True
+    End If
+    MsgBox errMsg, vbExclamation
+End Sub
+
+'------------------------- file discovery -------------------------
+
+Private Sub CollectSubprojects(parent As Project, files As Collection, unread As Collection)
+    Dim s As Subproject, sp As Project, pth As String
+    For Each s In parent.Subprojects
+        Set sp = Nothing
+        pth = ""
+        On Error Resume Next
+        pth = s.Path
+        Set sp = s.SourceProject
+        On Error GoTo 0
+        If sp Is Nothing Then
+            unread.Add IIf(Len(pth) > 0, pth, "(unknown subproject in " & parent.Name & ")")
+        ElseIf Not dFiles.Exists(sp.FullName) Then
+            RegisterFile sp
+            files.Add sp
+            CollectSubprojects sp, files, unread      'nested subprojects
+        End If
+    Next s
+End Sub
+
+Private Sub RegisterFile(p As Project)
+    Dim nm As String
+    Set dFiles(p.FullName) = p
+    nm = p.Name
+    If Not dFiles.Exists(nm) Then Set dFiles(nm) = p
+    nm = BaseName(nm)
+    If Not dFiles.Exists(nm) Then Set dFiles(nm) = p
+End Sub
+
+'------------------------- the single pass over one file -------------------------
+
+Private Sub ScanProject(p As Project, ByVal isMaster As Boolean, ByVal hasSubs As Boolean, _
+                        recon() As Variant, ByVal ri As Long)
+
+    Dim t As Task, dep As TaskDependency, o As Task
+    Dim mpd As Double, hiFloat As Double, hiDur As Double
+    Dim sName As String, sBase As String
+    Dim row As Variant, built As Boolean, bad As Boolean
+    Dim vAS As Variant, vAF As Variant, vBF As Variant, vD As Variant
+    Dim hasAF As Boolean, hasBF As Boolean, isPred As Boolean
+    Dim dur As Double, ts As Double, bd As Double, lg As Double
+    Dim uid As Long, nP As Long, nS As Long
+    Dim qRows As Long, qBlank As Long, qSumm As Long, qExt As Long, qInact As Long
+    Dim qMile As Long, qLoe As Long, qAss As Long, qComp As Long, qInc As Long
+
+    sName = p.Name
+    sBase = BaseName(sName)
+    curFile = sName
+    mpd = p.HoursPerDay * 60                 'each file's own hours-per-day
+    If mpd <= 0 Then mpd = 480
+    hiFloat = HIGH_FLOAT_DAYS * mpd
+    hiDur = HIGH_DUR_DAYS * mpd
+
+    For Each t In p.Tasks
+        If t Is Nothing Then
+            qRows = qRows + 1: qBlank = qBlank + 1
+            GoTo NextTask
+        End If
+
+        'In the master, keep only rows that live in the master file itself;
+        'subproject rows are read from their own files.
+        If isMaster And hasSubs Then
+            If StrComp(BaseName(t.Project), sBase, vbTextCompare) <> 0 Then GoTo NextTask
+        End If
+
+        qRows = qRows + 1
+        If t.Summary Then
+            qSumm = qSumm + 1: GoTo NextTask
+        End If
+        If isMaster Then
+            If Len(t.Subproject) > 0 Then          'inserted-project placeholder row
+                qSumm = qSumm + 1: GoTo NextTask
+            End If
+        End If
+        If t.ExternalTask Then
+            qExt = qExt + 1: GoTo NextTask
+        End If
+        If Not t.Active Then
+            qInact = qInact + 1: GoTo NextTask
+        End If
 
         vBF = t.BaselineFinish
         hasBF = IsDate(vBF)
         If hasBF Then If CDate(vBF) > maxBF Then maxBF = CDate(vBF)
 
         dur = NzNum(t.Duration)
-        If EXCLUDE_MILESTONES Then If dur = 0 Then GoTo NextTask
+        If EXCLUDE_MILESTONES Then
+            If dur = 0 Then
+                qMile = qMile + 1: GoTo NextTask
+            End If
+        End If
         If loeFld <> 0 Then
-            If StrComp(t.GetField(loeFld), LOE_VALUE, vbTextCompare) = 0 Then GoTo NextTask
+            If StrComp(t.GetField(loeFld), LOE_VALUE, vbTextCompare) = 0 Then
+                qLoe = qLoe + 1: GoTo NextTask
+            End If
         End If
 
         nTotal = nTotal + 1
+        qAss = qAss + 1
         built = False
-
-        'tally tasks per subproject (verification table on Summary)
-        sProj = t.Project
-        If sProj <> curProj Then
-            If Len(curProj) > 0 Then dProj(curProj) = dProj(curProj) + curCnt
-            curProj = sProj: curCnt = 0
-        End If
-        curCnt = curCnt + 1
+        bad = False
 
         vAS = t.ActualStart
         vAF = t.ActualFinish
         hasAF = IsDate(vAF)
 
         '--- 14 BEI numerator
-        If hasAF Then If CDate(vAF) <= sd Then nDone = nDone + 1
+        If hasAF Then
+            qComp = qComp + 1
+            If DayOf(vAF) <= sdDay Then nDone = nDone + 1
+        End If
 
         '--- 11 Missed tasks / 14 BEI denominator
         If hasBF Then
-            If CDate(vBF) <= sd Then
+            If DayOf(vBF) <= sdDay Then
                 nBLDue = nBLDue + 1
                 If Not hasAF Then
                     nMissed = nMissed + 1
                     AddTask cMissed, t, row, built, "Baseline finish on/before status date - not finished", mpd
-                ElseIf Int(CDbl(CDate(vAF))) > Int(CDbl(CDate(vBF))) Then
+                ElseIf DayOf(vAF) > DayOf(vBF) Then
                     nMissed = nMissed + 1
                     AddTask cMissed, t, row, built, "Finished later than baseline finish", mpd
                 End If
@@ -113,15 +372,14 @@ Public Sub DCMA14_Check()
         End If
 
         '--- 9 Invalid dates: actuals in the future (all tasks)
-        bad = False
         If IsDate(vAS) Then
-            If CDate(vAS) > sd Then
+            If DayOf(vAS) > sdDay Then
                 bad = True
                 AddTask cInvalid, t, row, built, "Actual start after status date", mpd
             End If
         End If
         If hasAF Then
-            If CDate(vAF) > sd Then
+            If DayOf(vAF) > sdDay Then
                 bad = True
                 AddTask cInvalid, t, row, built, "Actual finish after status date", mpd
             End If
@@ -130,15 +388,16 @@ Public Sub DCMA14_Check()
         '=============== INCOMPLETE TASKS ONLY ===============
         If Not hasAF Then
             nInc = nInc + 1
+            qInc = qInc + 1
             uid = t.UniqueID
             nP = 0: nS = 0
 
             '--- 1 Logic, 2 Leads, 3 Lags, 4 Relationship types
             For Each dep In t.TaskDependencies
                 Set o = dep.To
-                isPred = False
-                If o.UniqueID = uid Then            'UIDs repeat across subprojects,
-                    If o.Project = sProj Then isPred = True   'so confirm the project too
+                isPred = (o.UniqueID = uid)          'IDs are unique inside one file
+                If isPred And isMaster And hasSubs Then
+                    isPred = (StrComp(BaseName(o.Project), sBase, vbTextCompare) = 0)
                 End If
                 If isPred Then
                     nP = nP + 1
@@ -197,11 +456,11 @@ Public Sub DCMA14_Check()
                 AddTask cHiDur, t, row, built, "Duration > " & HIGH_DUR_DAYS & " d", mpd
             End If
 
-            '--- 9 Invalid dates: forecasts in the past
+            '--- 9 Invalid dates: forecasts in the past (calendar day)
             If Not IsDate(vAS) Then
                 vD = t.Start
                 If IsDate(vD) Then
-                    If CDate(vD) < sd Then
+                    If DayOf(vD) < sdDay Then
                         bad = True
                         AddTask cInvalid, t, row, built, "Forecast start before status date", mpd
                     End If
@@ -209,7 +468,7 @@ Public Sub DCMA14_Check()
             End If
             vD = t.Finish
             If IsDate(vD) Then
-                If CDate(vD) < sd Then
+                If DayOf(vD) < sdDay Then
                     bad = True
                     AddTask cInvalid, t, row, built, "Forecast finish before status date", mpd
                 End If
@@ -228,128 +487,41 @@ Public Sub DCMA14_Check()
         If bad Then nInvalid = nInvalid + 1
 NextTask:
     Next t
-    If Len(curProj) > 0 Then dProj(curProj) = dProj(curProj) + curCnt
 
-    '--- 13 CPLI = (critical path length + total float) / critical path length
-    Dim vPF As Variant, vPBF As Variant, cpl As Double, tf As Double
-    Dim cpli As Variant, cpliStat As String, cpliNote As String
-    cpli = "N/A": cpliStat = "N/A"
-    vPF = prj.ProjectSummaryTask.Finish
-    vPBF = prj.ProjectSummaryTask.BaselineFinish
-    If Not IsDate(vPBF) Then If maxBF > 0 Then vPBF = maxBF   'master not baselined: use latest task baseline
-    If IsDate(vPF) And IsDate(vPBF) Then
-        cpl = WorkDays(sd, CDate(vPF), mpd)
-        tf = WorkDays(CDate(vPF), CDate(vPBF), mpd)
-        If cpl > 0 Then
-            cpli = (cpl + tf) / cpl
-            If cpli >= 0.95 Then cpliStat = "PASS" Else cpliStat = "FAIL"
-        End If
-        cpliNote = "CPL = " & Format(cpl, "0.0") & " wd (status date to forecast finish); float vs baseline finish = " & Format(tf, "0.0") & " wd"
+    'reconciliation row for this file
+    If isMaster And hasSubs Then
+        recon(ri, 1) = sName & "  (master - its own rows only)"
     Else
-        cpliNote = "No baseline finish found - cannot calculate"
+        recon(ri, 1) = sName
     End If
-
-    '========================= EXCEL OUTPUT =========================
-    Set xl = CreateObject("Excel.Application")
-    xl.ScreenUpdating = False
-    Set wb = xl.Workbooks.Add(-4167)          'xlWBATWorksheet: one sheet
-    Set ws = wb.Worksheets(1)
-    ws.Name = "Summary"
-
-    Dim hdr(1 To 5, 1 To 2) As Variant
-    hdr(1, 1) = "DCMA 14-Point Assessment"
-    hdr(2, 1) = "Project":     hdr(2, 2) = prj.Name
-    hdr(3, 1) = "Status date": hdr(3, 2) = Format(sd, "dd-mmm-yyyy hh:nn")
-    hdr(4, 1) = "Population":  hdr(4, 2) = nTotal & " tasks, " & nInc & " incomplete, " & nRel & " predecessor links on incomplete tasks"
-    hdr(5, 1) = "Run"
-    ws.Range("A1").Resize(5, 2).Value = hdr
-    ws.Range("A1").Font.Bold = True
-
-    Dim s(1 To 14, 1 To 8) As Variant
-    PutRow s, 1, "Logic", nLogic, nInc, Ratio(nLogic, nInc), "<= 5%", PF(nLogic, nInc, 0.05, True), "Incomplete tasks missing a predecessor and/or successor"
-    PutRow s, 2, "Leads", nLead, nRel, Ratio(nLead, nRel), "0%", PF(nLead, nRel, 0, True), "Predecessor links with negative lag"
-    PutRow s, 3, "Lags", nLag, nRel, Ratio(nLag, nRel), "<= 5%", PF(nLag, nRel, 0.05, True), "Predecessor links with positive lag"
-    PutRow s, 4, "Relationship Types", nFS, nRel, Ratio(nFS, nRel), ">= 90%", PF(nFS, nRel, 0.9, False), "Finish-to-Start links as a share of all links"
-    PutRow s, 5, "Hard Constraints", nHard, nInc, Ratio(nHard, nInc), "<= 5%", PF(nHard, nInc, 0.05, True), "MSO, MFO, SNLT, FNLT on incomplete tasks"
-    PutRow s, 6, "High Float", nHiFloat, nInc, Ratio(nHiFloat, nInc), "<= 5%", PF(nHiFloat, nInc, 0.05, True), "Total slack > " & HIGH_FLOAT_DAYS & " working days"
-    PutRow s, 7, "Negative Float", nNegFloat, nInc, Ratio(nNegFloat, nInc), "0%", PF(nNegFloat, nInc, 0, True), "Total slack < 0"
-    PutRow s, 8, "High Duration", nHiDur, nInc, Ratio(nHiDur, nInc), "<= 5%", PF(nHiDur, nInc, 0.05, True), "Baseline duration > " & HIGH_DUR_DAYS & " working days"
-    PutRow s, 9, "Invalid Dates", nInvalid, nTotal, Ratio(nInvalid, nTotal), "0%", PF(nInvalid, nTotal, 0, True), "Forecast dates before, or actual dates after, the status date"
-    PutRow s, 10, "Resources", nNoRes, nIncDur, Ratio(nNoRes, nIncDur), "0%", PF(nNoRes, nIncDur, 0, True), "Incomplete tasks with duration and no resources"
-    PutRow s, 11, "Missed Tasks", nMissed, nBLDue, Ratio(nMissed, nBLDue), "<= 5%", PF(nMissed, nBLDue, 0.05, True), "Baseline finish <= status date, finished late or not finished"
-    PutRow s, 12, "Critical Path Test", "", "", "Manual", "Finish slips ~1:1", "MANUAL", "Add 600d to a critical task on a COPY and confirm the project finish moves by about the same amount"
-    PutRow s, 13, "Critical Path Length Index", "", "", cpli, ">= 0.95", cpliStat, cpliNote
-    PutRow s, 14, "Baseline Execution Index", nDone, nBLDue, Ratio(nDone, nBLDue), ">= 0.95", PF(nDone, nBLDue, 0.95, False), "Tasks finished / tasks baselined to finish by status date"
-
-    ws.Range("A7").Resize(1, 8).Value = Array("#", "Metric", "Count", "Population", "Result", "Threshold", "Status", "Basis")
-    ws.Range("A7").Resize(1, 8).Font.Bold = True
-    ws.Range("A8").Resize(14, 8).Value = s
-    ws.Range("E8:E18").NumberFormat = "0.00%"
-    ws.Range("E20:E21").NumberFormat = "0.00"
-    ws.Range("E8:G21").HorizontalAlignment = -4108      'xlCenter
-    For i = 1 To 14
-        Select Case s(i, 7)
-            Case "PASS": ws.Cells(7 + i, 7).Interior.Color = RGB(198, 239, 206)
-            Case "FAIL": ws.Cells(7 + i, 7).Interior.Color = RGB(255, 199, 206)
-            Case Else:   ws.Cells(7 + i, 7).Interior.Color = RGB(255, 235, 156)
-        End Select
-    Next i
-
-    'verification table: tasks analysed per subproject
-    ws.Range("B24").Value = "Tasks analysed per subproject (master contains " & prj.Subprojects.Count & " subprojects)"
-    ws.Range("B24").Font.Bold = True
-    If dProj.Count > 0 Then
-        ReDim sp(1 To dProj.Count, 1 To 2)
-        i = 0
-        For Each k In dProj.Keys
-            i = i + 1
-            sp(i, 1) = k
-            sp(i, 2) = dProj(k)
-        Next k
-        ws.Range("B25").Resize(dProj.Count, 2).Value = sp
+    If IsDate(p.StatusDate) Then
+        recon(ri, 2) = Format(CDate(p.StatusDate), "dd-mmm-yyyy")
+        If DayOf(p.StatusDate) <> sdDay Then nSdDiff = nSdDiff + 1
+    Else
+        recon(ri, 2) = "none"
     End If
-
-    'detail sheets
-    hT = Array("PUID (Text15)", "Subproject", "Unique ID", "ID", "Task Name", "Finding", "% Complete", _
-               "Duration (d)", "Baseline Duration (d)", "Start", "Finish", "Baseline Start", "Baseline Finish", _
-               "Actual Start", "Actual Finish", "Total Slack (d)", "Constraint Type", "Constraint Date")
-    hR = Array("Successor PUID (Text15)", "Successor Subproject", "Successor Unique ID", "Successor Name", _
-               "Predecessor PUID (Text15)", "Predecessor Subproject", "Predecessor Unique ID", "Predecessor Name", _
-               "Link Type", "Lag", "Lag Basis", "Finding")
-
-    DumpSheet wb, "01 Logic", hT, cLogic, False
-    DumpSheet wb, "02 Leads", hR, cLead, True
-    DumpSheet wb, "03 Lags", hR, cLag, True
-    DumpSheet wb, "04 Non-FS Links", hR, cNonFS, True
-    DumpSheet wb, "05 Hard Constraints", hT, cHard, False
-    DumpSheet wb, "06 High Float", hT, cHiFloat, False
-    DumpSheet wb, "07 Negative Float", hT, cNegFloat, False
-    DumpSheet wb, "08 High Duration", hT, cHiDur, False
-    DumpSheet wb, "09 Invalid Dates", hT, cInvalid, False
-    DumpSheet wb, "10 Resources", hT, cNoRes, False
-    DumpSheet wb, "11 Missed Tasks", hT, cMissed, False
-
-    ws.Range("B5").Value = Format(Now, "dd-mmm-yyyy hh:nn") & "  (" & Format(Timer - tStart, "0.0") & " s)"
-    ws.Columns("A:H").AutoFit
-    ws.Activate
-    xl.ScreenUpdating = True
-    xl.Visible = True
-    Application.ScreenUpdating = True
-    Exit Sub
-
-Fail:
-    errMsg = "DCMA check stopped: " & Err.Description
-    On Error Resume Next
-    If Not t Is Nothing Then errMsg = errMsg & vbCrLf & "Last task: " & t.Project & " / UID " & t.UniqueID
-    Application.ScreenUpdating = True
-    If Not xl Is Nothing Then
-        xl.ScreenUpdating = True
-        xl.Visible = True
-    End If
-    MsgBox errMsg, vbExclamation
+    recon(ri, 3) = qRows:  recon(ri, 4) = qBlank: recon(ri, 5) = qSumm
+    recon(ri, 6) = qExt:   recon(ri, 7) = qInact: recon(ri, 8) = qMile
+    recon(ri, 9) = qLoe:   recon(ri, 10) = qAss:  recon(ri, 11) = qComp
+    recon(ri, 12) = qInc
+    curFile = ""
 End Sub
 
 '------------------------- helpers -------------------------
+
+Private Sub ResetState()
+    sdDay = 0: loeFld = 0: maxBF = 0: curFile = "": nSdDiff = 0
+    nTotal = 0: nInc = 0: nIncDur = 0: nRel = 0: nFS = 0
+    nLogic = 0: nLead = 0: nLag = 0: nHard = 0
+    nHiFloat = 0: nNegFloat = 0: nHiDur = 0
+    nInvalid = 0: nNoRes = 0: nMissed = 0: nBLDue = 0: nDone = 0
+    Set cLogic = New Collection: Set cLead = New Collection: Set cLag = New Collection
+    Set cNonFS = New Collection: Set cHard = New Collection: Set cHiFloat = New Collection
+    Set cNegFloat = New Collection: Set cHiDur = New Collection: Set cInvalid = New Collection
+    Set cNoRes = New Collection: Set cMissed = New Collection
+    Set dFiles = CreateObject("Scripting.Dictionary")
+    dFiles.CompareMode = vbTextCompare
+End Sub
 
 'Adds a task row to a collector; task fields are read only once per flagged task
 Private Sub AddTask(c As Collection, t As Task, row As Variant, built As Boolean, _
@@ -386,14 +558,22 @@ End Function
 
 Private Function RelRow(t As Task, dep As TaskDependency, ByVal mpd As Double, _
                         ByVal finding As String) As Variant
-    Dim r(1 To RC) As Variant, p As Task, lg As Double
+    Dim r(1 To RC) As Variant, p As Task, q As Task, lg As Double
     Set p = dep.From
     r(1) = t.Text15                       'successor PUID
     r(2) = t.Project
     r(3) = t.UniqueID
     r(4) = t.Name
+    If p.ExternalTask Then                'cross-project link: swap the ghost for the real task
+        Set q = RealTask(dep, p.Name)
+        If q Is Nothing Then
+            r(6) = "External link - source task not resolved"
+        Else
+            Set p = q
+        End If
+    End If
     r(5) = p.Text15                       'predecessor PUID
-    r(6) = p.Project
+    If IsEmpty(r(6)) Then r(6) = p.Project
     r(7) = p.UniqueID
     r(8) = p.Name
     Select Case dep.Type
@@ -417,6 +597,29 @@ Private Function RelRow(t As Task, dep As TaskDependency, ByVal mpd As Double, _
     End If
     r(12) = finding
     RelRow = r
+End Function
+
+'Finds the real task behind a ghost task using the link's external path ("...\File.mpp\ID").
+'Returns Nothing if the file is not part of this master or the name does not match.
+Private Function RealTask(dep As TaskDependency, ByVal ghostName As String) As Task
+    Dim pth As String, k As Long, fileKey As String, id As Long
+    Dim src As Project, q As Task
+    On Error Resume Next
+    pth = dep.Path
+    k = InStrRev(pth, "\")
+    If k = 0 Then Exit Function
+    If Not IsNumeric(Mid$(pth, k + 1)) Then Exit Function
+    id = CLng(Mid$(pth, k + 1))
+    fileKey = Left$(pth, k - 1)
+    If dFiles.Exists(fileKey) Then
+        Set src = dFiles(fileKey)
+    ElseIf dFiles.Exists(BaseName(fileKey)) Then
+        Set src = dFiles(BaseName(fileKey))
+    End If
+    If src Is Nothing Then Exit Function
+    Set q = src.Tasks(id)
+    If q Is Nothing Then Exit Function
+    If StrComp(q.Name, ghostName, vbTextCompare) = 0 Then Set RealTask = q
 End Function
 
 'Writes one collector to a new sheet with a single Range.Value assignment
@@ -490,6 +693,18 @@ Private Function WorkDays(ByVal d1 As Date, ByVal d2 As Date, ByVal mpd As Doubl
     Else
         WorkDays = -Application.DateDifference(d2, d1) / mpd
     End If
+End Function
+
+Private Function DayOf(ByVal v As Variant) As Long
+    DayOf = CLng(Int(CDbl(CDate(v))))
+End Function
+
+Private Function BaseName(ByVal s As String) As String
+    Dim k As Long
+    k = InStrRev(s, "\")
+    If k > 0 Then s = Mid$(s, k + 1)
+    If LCase$(Right$(s, 4)) = ".mpp" Then s = Left$(s, Len(s) - 4)
+    BaseName = s
 End Function
 
 Private Function NzNum(ByVal v As Variant) As Double
