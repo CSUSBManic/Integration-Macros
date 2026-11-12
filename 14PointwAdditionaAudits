@@ -44,7 +44,7 @@ Private cNegFloat As Collection, cHiDur As Collection, cInvalid As Collection
 Private cNoRes As Collection, cMissed As Collection
 Private cOos As Collection, cDangS As Collection, cDangF As Collection, cSnet As Collection
 
-Public Sub DCMA14_Check()
+Public Sub DCMA14_Check_w_Additional_Audits()
 
     Dim prj As Project, p As Project
     Dim files As New Collection, unread As New Collection
